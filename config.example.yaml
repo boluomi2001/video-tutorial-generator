@@ -1,0 +1,22 @@
+# wx_channel 配置模板
+# 复制本文件为 config.yaml 并填入你的配置
+
+# === 核心配置 ===
+port: 2025                    # 服务端口
+download_dir: downloads       # 下载目录
+
+# === 云端管理 ===
+cloud_hub_url: ws://wx.dongzuren.com/ws/client
+cloud_secret: ""              # 云端密钥（如有）
+
+# === 设备标识（首次运行自动生成，请勿手动修改）===
+machine_id: ""                # 留空，运行时自动生成
+
+# === 性能配置（可选）===
+download_concurrency: 5       # 下载并发数
+
+# === 下载命名（可选）===
+download_filename_template: "" # 可用 {date} {datetime} {author} {title} {duration} {video_id} {size}
+
+# === 功能开关（可选）===
+radar_enabled: false          # 是否启用对标雷达

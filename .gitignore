@@ -1,0 +1,53 @@
+# ============================================
+# 敏感信息（严禁提交，含 API Key / 设备指纹）
+# ============================================
+config.yaml
+hardware_fingerprint.json
+*.log
+logs/
+
+# ============================================
+# Python
+# ============================================
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+*.egg-info/
+.Python
+
+# ============================================
+# 大型二进制文件 / 模型文件（重新下载即可）
+# ============================================
+tools/weixin-favor-kb/models/
+tools/ffmpeg/
+tools/wx_channel/*.exe
+tools/wx_channel/config.yaml
+tools/wx_channel/hardware_fingerprint.json
+tools/wx_channel/logs/
+tools/wx_channel/downloads/
+
+# ============================================
+# 运行时数据（视频 / 生成内容）
+# ============================================
+tools/weixin-favor-kb/downloads/
+tools/weixin-favor-kb/output/
+outputs/
+
+# ============================================
+# 个人记忆与身份文件（不随项目分享）
+# ============================================
+.workbuddy/memory/
+.workbuddy/BOOTSTRAP.md
+.workbuddy/SOUL.md
+.workbuddy/IDENTITY.md
+.workbuddy/USER.md
+
+# ============================================
+# IDE / 系统
+# ============================================
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

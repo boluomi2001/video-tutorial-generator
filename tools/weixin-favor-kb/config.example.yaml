@@ -1,0 +1,68 @@
+# 微信视频解析流水线 — 配置模板
+# 复制本文件为 config.yaml 并填入你的真实配置
+
+# === Whisper 语音转文字 ===
+whisper:
+  model_size: "medium"        # 短视频首选模型（高精度），可选 small/medium/large-v3
+  fallback_model: "small"     # 长视频自动降级的快速模型
+  max_duration_s: 300         # 超过 N 秒自动切换 fallback 模型
+  device: "cpu"               # 无 GPU 用 cpu，有 NVIDIA GPU 可改 cuda
+  compute_type: "int8"        # CPU 用量化 int8，GPU 可用 int8_float16
+  language: "zh"
+
+# === 视觉分析大模型 ===
+llm:
+  api_key: "sk-你的硅基流动APIKey"   # ← 必填，替换为你的 Key
+  base_url: "https://api.siliconflow.cn/v1"
+  model: "Qwen/Qwen3-VL-32B-Instruct"
+  # 备选模型：Qwen/Qwen3-VL-8B-Instruct（更快更便宜）
+
+# === 关键帧提取 ===
+frames:
+  threshold: 30.0              # 场景变化检测阈值，越大提取帧越少
+  max_frames: 20               # 最多提取的帧数
+
+# === OCR ===
+ocr:
+  confidence_threshold: 0.5    # 文字识别置信度阈值
+
+# === 内容分类 ===
+categories:
+  - name: "RAG"
+    emoji: "🔍"
+    description: "检索增强生成、向量检索、知识库问答、文档解析"
+  - name: "AGENT"
+    emoji: "🤖"
+    description: "AI智能体开发、Agent框架、Skills、MCP、多智能体编排"
+  - name: "AI/ML"
+    emoji: "🧠"
+    description: "大模型通用、模型训练、AI产品、AI工具推荐、TTS/OCR"
+  - name: "前端"
+    emoji: "🎨"
+    description: "前端框架、UI/UX设计、CSS、React/Vue/TypeScript"
+  - name: "后端"
+    emoji: "⚙️"
+    description: "后端架构、数据库、API设计、服务器部署"
+  - name: "DevOps"
+    emoji: "🔧"
+    description: "运维、HTTPS/SSL、CI/CD、Docker/K8s、云服务、部署"
+  - name: "开发"
+    emoji: "💻"
+    description: "通用开发工具、编程效率、建站、开源工具"
+  - name: "创富"
+    emoji: "💰"
+    description: "创业、赚钱、投资理财、商业案例、流量运营"
+  - name: "生活技巧"
+    emoji: "🏠"
+    description: "健康养生、职场技巧、科普知识、软件使用技巧"
+  - name: "其他"
+    emoji: "📎"
+    description: "无法归入以上任何类别的"
+
+# === 路径 ===
+paths:
+  downloads: "./downloads"
+  output: "./output"
+  transcripts: "./output/transcripts"
+  notes: "./output/notes"
+  frames: "./output/frames"

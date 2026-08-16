@@ -1,0 +1,30 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+*.pyo
+.ruff_cache/
+
+# Data / outputs (user-specific)
+downloads/
+output/
+obsidian_vault/
+downlaod/
+
+# Logs
+*.log
+pipeline.log
+
+# Blog images (local only)
+blog_img/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+.env
