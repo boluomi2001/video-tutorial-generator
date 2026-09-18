@@ -1,0 +1,61 @@
+# wx_video_download（视频下载器）配置模板
+# 由 scripts/setup.py 复制为 config.yaml 并自动填入绝对路径
+#
+# 端口约定：API + 管理页 + MCP 均走 2022
+# MCP 端点：http://127.0.0.1:2022/mcp
+
+download:
+  # 下载落盘目录，setup.py 会替换成 <项目>/tools/weixin-favor-kb/downloads
+  dir: "__DOWNLOADS_DIR__"
+  filenameTemplate: "{{filename}}_{{spec}}"
+  maxRunning: 3
+  resourceConcurrency: 100
+  segmentConcurrency: 10
+  playDoneAudio: false
+  defaultActionWhenExisting: ""
+
+api:
+  protocol: "http"
+  hostname: "127.0.0.1"
+  port: 2022
+
+# MCP 服务：Agent 通过它调用 download_wxchannels_video / download_content
+mcp:
+  enabled: true
+
+# 系统代理：下载器会写系统代理以便抓取网页资源
+# 首次启动 Windows 可能弹 UAC 或杀软拦截，允许即可
+proxy:
+  enabled: true
+  system: true
+  hostname: "127.0.0.1"
+  port: 2023
+  tcpRelay:
+    enabled: false
+    hostname: "127.0.0.1"
+    port: 9900
+
+scraper:
+  retainedJobs: 20
+
+db:
+  type: "sqlite"
+  filepath: "%CWD%/data.db"
+
+update:
+  sources:
+    - type: github
+      priority: 1
+      github_repo: ltaoo/wx_channels_download
+      github_token: ""      # 可选，留空则走匿名 API（有速率限制，够用）
+      enabled: true
+      need_check_checksum: false
+
+channels:
+  disableLocationToHome: false
+  download:
+    defaultHighest: false
+    frontend: false
+    cover: false
+    pauseWhenDownload: false
+    forceCheckAllFeeds: false

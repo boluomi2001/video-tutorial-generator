@@ -14,8 +14,13 @@ whisper:
 llm:
   api_key: "sk-你的硅基流动APIKey"   # ← 必填，替换为你的 Key
   base_url: "https://api.siliconflow.cn/v1"
-  model: "Qwen/Qwen3-VL-32B-Instruct"
-  # 备选模型：Qwen/Qwen3-VL-8B-Instruct（更快更便宜）
+  # 视觉理解 / 教程生成：MoE 架构（激活 3B），4 图批次 13-19s，稳定不超时
+  model: "Qwen/Qwen3-VL-30B-A3B-Instruct"
+  # 分类 / 速览 / 清单 / 自检等纯文本轻量任务，约 0.5s
+  fast_model: "Qwen/Qwen2.5-7B-Instruct"
+  # 备选模型：
+  #   Qwen/Qwen3-VL-8B-Instruct      5-9s，内容偏简，省钱可用
+  #   Qwen/Qwen3-VL-32B-Instruct     73-120s，精度略高但常超时
 
 # === 关键帧提取 ===
 frames:

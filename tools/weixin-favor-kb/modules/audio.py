@@ -5,6 +5,11 @@ from pathlib import Path
 
 from loguru import logger
 
+try:
+    from modules.paths import resolve_ffmpeg
+except ImportError:  # 直接以脚本方式运行时
+    from paths import resolve_ffmpeg
+
 
 def extract_audio(video_path: str, output_path: str) -> str:
     """使用 ffmpeg 从视频中提取音频，输出为 16kHz 单声道 WAV（Whisper 最优格式）。"""
@@ -16,7 +21,7 @@ def extract_audio(video_path: str, output_path: str) -> str:
 
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg_path = r"D:\work\2026-07-12-13-31-07\tools\ffmpeg\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe"
+    ffmpeg_path = resolve_ffmpeg()
     cmd = [
         ffmpeg_path,
         "-i",

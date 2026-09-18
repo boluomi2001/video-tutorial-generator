@@ -1,10 +1,23 @@
 # ============================================
-# 敏感信息（严禁提交，含 API Key / 设备指纹）
+# 敏感信息（严禁提交，含 API Key / 凭据 / 设备指纹）
 # ============================================
 config.yaml
+config.local.yaml
 hardware_fingerprint.json
 *.log
 logs/
+.env
+
+# 下载器运行时数据（含下载历史与凭据缓存）
+tools/wx_channels_download*/config.yaml
+tools/wx_channels_download*/data.db
+tools/wx_channels_download*/data.db-*
+tools/wx_channels_download*/cache/
+tools/wx_channels_download*/logs/
+tools/wx_channels_download*/downloads/
+tools/wx_channels_download_v260907/
+tools/wx_channel/
+_probe.txt
 
 # ============================================
 # Python
@@ -39,6 +52,8 @@ outputs/
 # 个人记忆与身份文件（不随项目分享）
 # ============================================
 .workbuddy/memory/
+# 本机技能安装位置，正式版在仓库的 skill/ 目录下
+.workbuddy/skills/
 .workbuddy/BOOTSTRAP.md
 .workbuddy/SOUL.md
 .workbuddy/IDENTITY.md

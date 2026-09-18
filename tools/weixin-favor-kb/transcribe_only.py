@@ -11,8 +11,9 @@ from pathlib import Path
 from datetime import datetime
 from modules.audio import extract_audio
 from modules.transcribe import Transcriber
+from modules.paths import resolve_ffmpeg
 
-FFMPEG = r"D:\work\2026-07-12-13-31-07\tools\ffmpeg\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe"
+FFMPEG = resolve_ffmpeg()
 DOWNLOADS = Path(__file__).parent / "downloads"
 
 def sanitize(name: str, max_len: int = 40) -> str:

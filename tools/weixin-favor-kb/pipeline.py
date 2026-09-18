@@ -20,7 +20,9 @@ from rich.progress import (
 )
 from rich.table import Table
 
-FFMPEG_PATH = r"D:\work\2026-07-12-13-31-07\tools\ffmpeg\ffmpeg-8.1.2-essentials_build\ffmpeg-8.1.2-essentials_build\bin\ffmpeg.exe"
+from modules.paths import resolve_ffmpeg
+
+FFMPEG_PATH = resolve_ffmpeg()
 
 from modules.audio import extract_audio
 from modules.transcribe import Transcriber
