@@ -1,11 +1,33 @@
 """一键视频分析流水线：给链接或文件，直接产出教学笔记。
 
 用法:
-    python auto_run.py "<视频号链接 / 公众号文章链接 / 本地文件路径>" [--keep] [--no-publish] [--wait-manual 30]
+    # 单条
+    python auto_run.py "<视频号链接 / 公众号文章链接 / 本地文件路径>" [选项]
+
+    # 批量（多条位置参数）
+    python auto_run.py "<链接1>" "<链接2>" "<链接3>" ...
+
+    # 批量（从文件读，一行一条，# 开头为注释）
+    python auto_run.py --from-file links.txt
+
+    # 断点续跑（跳过已成功项，重试失败项）
+    python auto_run.py --from-file links.txt --resume output/batch_20261004_210000
+
+选项:
+    --keep            保留视频与中间文件
+    --no-publish      不复制到项目 outputs 目录
+    --wait-manual N   等待手动下载的分钟数（默认 30）
 
 流程:
     视频号/文件 → 下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
     公众号文章  → 抓取 → 保真转 Markdown（原文归档，不改写）→ 清理
+
+批量模式:
+    串行逐条执行，单条失败不中断后续；每条独立 run 目录（沿用 output/）。
+    批次目录 output/batch_<时间戳>/ 下产出：
+      - batch_state.json        执行状态（供 --resume 续跑）
+      - _batch_<时间戳>.md      汇总表（成功/失败/耗时/成本/产物）
+      - .ima_pending_batch.json ima 待上传清单（汇总全部成功项）
 进度写入 <run_dir>/progress.json，供外部轮询。
 """
 
@@ -691,25 +713,56 @@ def write_article_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
     return p
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("source", help="视频号链接 / 公众号文章链接 / 直链 / 本地文件路径")
-    ap.add_argument("--keep", action="store_true", help="保留视频与中间文件")
-    ap.add_argument("--no-publish", action="store_true", help="不复制到项目 outputs 目录")
-    ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
-    args = ap.parse_args()
+def run_one(source: str, no_publish: bool = False, keep: bool = False,
+            wait_manual: int = 30, ts: str | None = None) -> dict:
+    """处理单条输入（视频号 / 公众号文章 / 直链 / 本地文件）。
 
-    cfg = load_config()
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    is_article = wx_article.is_article_url(args.source)
+    这是单条模式的完整逻辑，也被批量模式逐条复用。
+    返回统一结构，便于批量层汇总：
+        {
+          "source": 原始输入,
+          "ok": bool,
+          "source_type": "video" | "article",
+          "video_type": 类型名,
+          "title": 最终标题,
+          "run_dir": run 目录,
+          "final_md": 最终交付物路径（失败为 None）,
+          "pending": ima 待上传清单路径（失败为 None）,
+          "notes": 产出文件列表,
+          "elapsed_sec": 耗时,
+          "cost_cny": 成本,
+          "error": 失败原因（成功为 None）,
+        }
+    """
+    started = time.time()
+    stamp = ts or datetime.now().strftime("%Y%m%d_%H%M%S")
+    is_article = wx_article.is_article_url(source)
+
+    def _out(ok: bool, **kw) -> dict:
+        base = {
+            "source": source, "ok": ok,
+            "source_type": "article" if is_article else "video",
+            "video_type": "", "title": "", "run_dir": None, "final_md": None,
+            "pending": None, "notes": [], "elapsed_sec": 0,
+            "cost_cny": 0.0, "error": None,
+        }
+        base["elapsed_sec"] = round(time.time() - started, 1)
+        base.update(kw)
+        return base
+
     if is_article:
         name = "wechat_article"
     else:
-        name = sanitize(Path(args.source).stem if not args.source.startswith("http")
+        name = sanitize(Path(source).stem if not source.startswith("http")
                         else "sph_video", 30)
-    run_dir = OUTPUT / f"{ts}_{name}"
+    run_dir = OUTPUT / f"{stamp}_{name}"
+    # 批量下同一秒可能重名，加后缀避免互相覆盖
+    suffix = 2
+    while run_dir.exists():
+        run_dir = OUTPUT / f"{stamp}_{name}_{suffix}"
+        suffix += 1
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "_run_id.txt").write_text(f"{ts}_{name}", encoding="utf-8")
+    (run_dir / "_run_id.txt").write_text(run_dir.name, encoding="utf-8")
 
     progress = Progress(run_dir / "progress.json")
     video: Path | None = None
@@ -718,11 +771,11 @@ def main() -> int:
     try:
         # ---------- 公众号文章通道 ----------
         if is_article:
-            progress.update("init", 2, f"公众号文章 {args.source[:80]}")
-            out = run_article(args.source, run_dir, progress)
+            progress.update("init", 2, f"公众号文章 {source[:80]}")
+            out = run_article(source, run_dir, progress)
             res = out["result"]
             notes = out["notes"]
-            if not args.no_publish:
+            if not no_publish:
                 notes += publish(res, out["title"], notes)
             final_md = Path(notes[0])
             pending = write_article_pending(final_md.parent, final_md, res)
@@ -734,17 +787,19 @@ def main() -> int:
             log("-" * 50)
             log(f"最终交付物: {final_md}")
             log(f"待上传清单: {pending}")
-            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
-            return 0
+            return _out(True, video_type="公众号文章", title=res["title"],
+                        run_dir=run_dir, final_md=final_md, pending=pending,
+                        notes=notes)
 
         # ---------- 视频通道 ----------
-        progress.update("init", 2, f"开始处理 {args.source[:80]}")
-        video, is_temp = resolve_source(args.source, run_dir, progress, args.wait_manual)
-        out = run_stages(video, is_temp, cfg, run_dir, progress, keep=args.keep)
+        progress.update("init", 2, f"开始处理 {source[:80]}")
+        video, is_temp = resolve_source(source, run_dir, progress, wait_manual)
+        out = run_stages(video, is_temp, cfg=load_config(), run_dir=run_dir,
+                         progress=progress, keep=keep)
 
         res = out["result"]
         notes = out["notes"]
-        if not args.no_publish:
+        if not no_publish:
             notes += publish(res, out["title"], notes)
 
         # 写 ima 待上传清单（最终交付物 = 整合后的单文件 md）
@@ -767,8 +822,10 @@ def main() -> int:
             log("-" * 50)
             log(f"最终交付物: {final_md}")
             log(f"待上传清单: {pending}")
-            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
-        return 0
+        return _out(True, video_type=res.get("video_type", ""),
+                    title=out.get("title", ""), run_dir=run_dir,
+                    final_md=final_md, pending=pending, notes=notes,
+                    cost_cny=float(res.get("cost", {}).get("cost_cny", 0) or 0))
 
     except Exception as e:
         tb = traceback.format_exc()
@@ -777,7 +834,284 @@ def main() -> int:
         # 失败时保留视频便于重试
         if video and is_temp:
             log(f"失败，已保留视频: {video}")
+        return _out(False, run_dir=run_dir, error=f"{type(e).__name__}: {e}")
+
+
+# ---------------------------------------------------------------- 批量模式
+BATCH_STATE_NAME = "batch_state.json"
+
+
+def _json_default(o):
+    """让 Path 等对象可被 json 序列化（run_one 返回值里含 Path）。"""
+    if isinstance(o, Path):
+        return str(o)
+    if isinstance(o, set):
+        return sorted(o)
+    return str(o)
+
+
+def _dump_batch_state(batch_dir: Path, sources: list[str],
+                      results: list[dict], started_at: str) -> None:
+    """落盘批次状态。
+
+    必须成功——否则 --resume 失去依据。因此这里不静默吞异常，
+    出错时打日志并抛出，避免"以为能续跑其实没记录"。
+    """
+    payload = {
+        "sources": sources,
+        "results": results,
+        "started_at": started_at,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    try:
+        (batch_dir / BATCH_STATE_NAME).write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2,
+                       default=_json_default),
+            encoding="utf-8")
+    except Exception as e:
+        log(f"⚠️ 批次状态写入失败（断点续跑将不可用）："
+            f"{type(e).__name__}: {e}")
+
+
+def load_sources(args) -> list[str]:
+    """收集待处理输入：位置参数 + --from-file 指定的文件。
+
+    文件规则：一行一条；支持 # 注释行与空行；自动去重（保序）。
+    """
+    items: list[str] = list(args.sources or [])
+
+    if args.from_file:
+        p = Path(args.from_file)
+        if not p.is_file():
+            raise FileNotFoundError(f"链接文件不存在：{p}")
+        for raw in p.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            items.append(line)
+
+    # 去重（保序），避免手抖重复导致白跑
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in items:
+        key = s.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(key)
+    return out
+
+
+def write_batch_summary(batch_dir: Path, results: list[dict],
+                        started_at: str) -> Path:
+    """写批次汇总 md，并返回路径。"""
+    ok = [r for r in results if r.get("ok")]
+    bad = [r for r in results if not r.get("ok")]
+    total_cost = sum(float(r.get("cost_cny") or 0) for r in results)
+    # 失败项的 elapsed 无意义（多为快速报错），只统计成功项耗时
+    ok_elapsed = sum(float(r.get("elapsed_sec") or 0) for r in ok)
+
+    lines = [
+        "# 批量处理汇总",
+        "",
+        f"- 批次开始：{started_at}",
+        f"- 批次结束：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- 总数：**{len(results)}**　成功：**{len(ok)}**　"
+        f"失败：**{len(bad)}**",
+        f"- 成功项累计耗时：{ok_elapsed:.0f}s　累计成本：¥{total_cost:.4f}",
+        "",
+        "| # | 状态 | 类型 | 标题 | 耗时 | 成本 | 产物 / 失败原因 |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for i, r in enumerate(results, 1):
+        if r.get("ok"):
+            mark = "✅"
+            art = Path(r["final_md"]).name if r.get("final_md") else "—"
+            detail = f"`{art}`"
+        else:
+            mark = "❌"
+            detail = (r.get("error") or "未知错误").replace("|", "\\|")[:120]
+        lines.append(
+            f"| {i} | {mark} | {r.get('video_type') or '—'} | "
+            f"{(r.get('title') or '—').replace('|', chr(92) + '|')[:40]} | "
+            f"{r.get('elapsed_sec') or 0}s | "
+            f"¥{float(r.get('cost_cny') or 0):.4f} | {detail} |"
+        )
+
+    if bad:
+        lines += ["", "## 失败明细（可直接复制重跑）", "", "```"]
+        for r in bad:
+            lines.append(r["source"])
+        lines += ["```", "",
+                  "> 用 `--from-file` 指向上面这段即可只重跑失败项。", ""]
+
+    p = batch_dir / f"_batch_{started_at}.md"
+    p.write_text("\n".join(lines), encoding="utf-8")
+    return p
+
+
+def write_batch_pending(batch_dir: Path, results: list[dict]) -> Path | None:
+    """汇总所有成功产出的 ima 待上传清单（供 Agent 一次性批量上传）。"""
+    items = []
+    for i, r in enumerate(results, 1):
+        if not r.get("ok") or not r.get("final_md"):
+            continue
+        md = Path(r["final_md"])
+        if not md.is_file():
+            continue
+        is_article = r.get("source_type") == "article"
+        items.append({
+            "seq": i,
+            "final_md": str(md),
+            "title": md.name,
+            "knowledge_base_id": "001a8016b30037f0",
+            "folder_hint": (ARTICLE_FOLDER_HINT if is_article
+                            else ("项目复刻教学"
+                                  if r.get("video_type") == VIDEO_TYPE_PROJECT
+                                  else "功能提升教学")),
+            "source_type": r.get("source_type"),
+            "source_url": r.get("source"),
+            "notes_dir": str(Path(r["run_dir"]) / "notes") if r.get("run_dir") else "",
+            "delete_local_after_verify": True,
+        })
+    if not items:
+        return None
+
+    manifest = {
+        "batch": True,
+        "count": len(items),
+        "knowledge_base_id": "001a8016b30037f0",
+        "delete_local_after_verify": True,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "items": items,
+    }
+    p = batch_dir / ".ima_pending_batch.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
+def run_batch(sources: list[str], args) -> int:
+    """串行批量执行：逐条隔离，失败不中断；支持断点续跑。"""
+    OUTPUT.mkdir(parents=True, exist_ok=True)
+
+    # 断点续跑：复用既有批次目录
+    resume_dir = Path(args.resume).resolve() if args.resume else None
+    if args.resume and not resume_dir.is_dir():
+        log(f"--resume 指向的目录不存在：{resume_dir}")
+        return 2
+
+    if resume_dir:
+        batch_dir = resume_dir
+        started_at = batch_dir.name.replace("batch_", "") or \
+            datetime.now().strftime("%Y%m%d_%H%M%S")
+        state_file = batch_dir / BATCH_STATE_NAME
+        prev: dict = {}
+        if state_file.is_file():
+            try:
+                prev = json.loads(state_file.read_text(encoding="utf-8"))
+            except Exception:
+                prev = {}
+        done_map = {r["source"]: r for r in prev.get("results", [])}
+        log(f"断点续跑：批次 {batch_dir.name}，历史记录 {len(done_map)} 条")
+    else:
+        started_at = datetime.now().strftime("%Y%m%d_%H%M%S")
+        batch_dir = OUTPUT / f"batch_{started_at}"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        done_map = {}
+
+    # 立刻写一份初始状态：即使第一条就崩，也能用 --resume 接上
+    _dump_batch_state(batch_dir, sources, [], started_at)
+
+    results: list[dict] = []
+    total = len(sources)
+    skipped = 0
+
+    for i, src in enumerate(sources, 1):
+        # 已完成且成功的项直接跳过（断点续跑核心）
+        old = done_map.get(src)
+        if old and old.get("ok"):
+            log(f"[{i}/{total}] 跳过（已成功）：{src[:70]}")
+            results.append(old)
+            skipped += 1
+            continue
+
+        log("")
+        log("#" * 60)
+        log(f"[{i}/{total}] 开始处理：{src[:100]}")
+        log("#" * 60)
+
+        r = run_one(src, no_publish=args.no_publish, keep=args.keep,
+                    wait_manual=args.wait_manual)
+        results.append(r)
+
+        if r["ok"]:
+            log(f"[{i}/{total}] ✅ 完成：{r.get('title') or r['source'][:60]}")
+        else:
+            log(f"[{i}/{total}] ❌ 失败：{r.get('error')}")
+            log(f"[{i}/{total}] 继续处理下一条…")
+
+        # 每处理一条就落盘状态，进程被杀也能续跑
+        _dump_batch_state(batch_dir, sources, results, started_at)
+
+    # ---------- 收尾：汇总 ----------
+    summary = write_batch_summary(batch_dir, results, started_at)
+    pending = write_batch_pending(batch_dir, results)
+
+    ok = [r for r in results if r.get("ok")]
+    log("")
+    log("=" * 60)
+    log(f"批量完成：{len(ok)}/{total} 成功"
+        + (f"（跳过 {skipped} 条已成功项）" if skipped else ""))
+    log(f"批次目录: {batch_dir}")
+    log(f"汇总清单: {summary}")
+    if pending:
+        log(f"待上传清单: {pending}")
+        log(f"Agent 下一步：读取该清单，逐条上传 ima → 回读校验 → 校验通过后删本地"
+            f"（共 {len(ok)} 项）")
+    else:
+        log("没有成功产出，无待上传清单。")
+    log("=" * 60)
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        description="一键视频分析流水线：单条或批量。")
+    ap.add_argument("sources", nargs="*",
+                    help="一条或多条：视频号链接 / 公众号文章链接 / 直链 / 本地文件路径")
+    ap.add_argument("--from-file", metavar="FILE",
+                    help="从文件读取链接（一行一条，# 开头为注释）")
+    ap.add_argument("--resume", metavar="BATCH_DIR",
+                    help="断点续跑：指向既有批次目录，跳过已成功项")
+    ap.add_argument("--keep", action="store_true", help="保留视频与中间文件")
+    ap.add_argument("--no-publish", action="store_true", help="不复制到项目 outputs 目录")
+    ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
+    args = ap.parse_args()
+
+    sources = load_sources(args)
+
+    # 批量模式：多条输入，或显式 --resume
+    if args.resume or len(sources) > 1:
+        if not sources and not args.resume:
+            ap.error("批量模式至少需要一条输入（位置参数或 --from-file）")
+        if not sources:
+            ap.error("--resume 需要同时给出待处理的输入列表")
+        log(f"批量模式：共 {len(sources)} 条待处理")
+        return run_batch(sources, args)
+
+    # 单条模式：保持原有输出格式与退出码
+    if len(sources) == 1:
+        r = run_one(sources[0], no_publish=args.no_publish, keep=args.keep,
+                    wait_manual=args.wait_manual)
+        if r["ok"]:
+            log("-" * 50)
+            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
+            return 0
         return 1
+
+    ap.print_help()
+    return 2
 
 
 if __name__ == "__main__":

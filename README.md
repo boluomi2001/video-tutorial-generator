@@ -384,6 +384,70 @@ tools\weixin-favor-kb\run_auto.cmd "D:\我的视频\demo.mp4"
 链接类型自动分流，无需额外参数。第一次会下载 Whisper 模型，耐心等。
 跑完到 `tools\weixin-favor-kb\output\<run_id>\notes\` 收成果。
 
+### 3.9 Step 8 —— 批量处理（一次给很多链接）
+
+一条条喂太慢？可以直接批量。**串行执行**，逐条独立，**单条失败不影响后面的**。
+
+**方式一：直接传多条链接**
+
+```powershell
+tools\weixin-favor-kb\run_auto.cmd "链接1" "链接2" "链接3" ...
+```
+
+**方式二：从文件读（推荐，30 条就写 30 行）**
+
+```powershell
+# links.txt 一行一条；空行与 # 开头的注释行会被忽略
+tools\weixin-favor-kb\run_auto.cmd --from-file links.txt
+```
+
+`links.txt` 示例：
+
+```
+# 视频号
+https://weixin.qq.com/sph/AAAAAAAA
+https://weixin.qq.com/sph/BBBBBBBB
+# 公众号文章
+https://mp.weixin.qq.com/s/CCCCCCCC
+# 本地文件也可以
+D:\我的视频\demo.mp4
+```
+
+自动去重（重复链接只跑一次）。
+
+**跑完看哪？** 除了每条自己的 `output/<run_id>/`，批次目录里会多出三份：
+
+```
+tools\weixin-favor-kb\output\batch_<时间戳>\
+├── batch_state.json          # 执行状态（供断点续跑）
+├── _batch_<时间戳>.md        # 📊 汇总表：成功/失败/类型/耗时/成本/产物
+└── .ima_pending_batch.json   # ima 待上传清单（汇总全部成功项）
+```
+
+汇总表长这样，一眼看全：
+
+| # | 状态 | 类型 | 标题 | 耗时 | 成本 | 产物 / 失败原因 |
+|---|---|---|---|---|---|---|
+| 1 | ✅ | 效率提升教学 | 作者A：某技巧 | 214.0s | ¥0.0490 | `作者A：某技巧.md` |
+| 2 | ❌ | — | — | 1.2s | ¥0.0000 | `DownloadError: Worker HTTP 500` |
+
+**断了怎么办？—— 断点续跑**
+
+跑到第 20 条崩了、或者你手动 Ctrl+C 了，**不用从头再来**：
+
+```powershell
+tools\weixin-favor-kb\run_auto.cmd --from-file links.txt --resume output\batch_20261004_210000
+```
+
+它会读取 `batch_state.json`，**跳过已成功的**，只重试失败项和没轮到的。
+状态是**每跑完一条就落盘**的，所以即使在最坏时机被打断也能接上。
+
+汇总表的失败明细区还给出了「可直接复制重跑」的链接段，粘进一个 txt 用 `--from-file` 就能单独补跑。
+
+> **性能预期**：串行模式下，2 分钟视频约 4-6 分钟/条，30 条大致 2-3 小时。
+> 公众号文章是秒级（2-5 秒），混在批量里几乎不占时间。
+> 脚本跑的时候可以关掉终端窗口吗？**不行**，进程结束任务就停了；但被打断可以续跑。
+
 ---
 
 ## 4. 工具清单与版本要求
@@ -554,9 +618,14 @@ tools\weixin-favor-kb\
 
 | 参数 | 说明 | 默认 |
 |---|---|---|
+| `--from-file <文件>` | 从文件批量读取链接（一行一条，`#` 注释） | — |
+| `--resume <批次目录>` | 断点续跑：跳过已成功项，只补失败项 | — |
 | `--keep` | 保留视频与中间文件 | 关 |
 | `--no-publish` | 不复制到 `outputs/` 目录 | 关 |
 | `--wait-manual <分钟>` | 等待手动下载的最长时间 | 30 |
+
+> 传**多条**位置参数（`auto_run.cmd "链接1" "链接2" ...`）或用 `--from-file` 即进入批量模式；
+> 只传一条时行为与以前完全一致。
 
 ---
 
