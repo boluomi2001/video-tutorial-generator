@@ -25,7 +25,7 @@ SERVICE_HOST = "127.0.0.1"
 SERVICE_PORT = 2025          # 旧版 wx_channel 本地服务端口
 TIMEOUT = 15
 
-WX_EXE = DOWNLOADER_DIR.parent / "wx_channel" / "wx_channel.exe"
+WX_EXE = REPO_ROOT / "tools" / "wx_channel" / "wx_channel.exe"
 WX_CWD = WX_EXE.parent
 # GUI 下载默认落盘目录
 WX_DOWNLOADS = WX_CWD / "downloads"
@@ -174,6 +174,144 @@ def fetch_direct(url: str, dest_dir: Path, filename: str | None = None) -> Path:
     with _opener().open(req, timeout=120) as resp, open(target, "wb") as f:
         f.write(resp.read())
     return target
+
+
+# ----------------------------------------------------------------------------
+# 云端解析（Cloudflare Worker）：视频号分享链接 → 直链，免登录态
+# ----------------------------------------------------------------------------
+# 部署方式见 SKILL.md「彻底免人工」章节：
+#   wx_channel.exe sph_deploy --config config.yaml
+# 部署后 cloudflare.sphHostname 会自动回填到 tools/wx_channel/config.yaml。
+# 本模块可直接读该 hostname，也可用环境变量 SPH_WORKER_URL 覆盖。
+
+SPH_WORKER_URL = os.environ.get("SPH_WORKER_URL", "").rstrip("/")
+SPH_WORKER_TIMEOUT = 20
+# Cloudflare Worker 默认拒绝空/异常 UA 的部分变体，统一带常规浏览器 UA
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def _load_worker_url() -> str:
+    """按优先级定位 Worker 地址：环境变量 > wx_channel/config.yaml 的 sphHostname。"""
+    if SPH_WORKER_URL:
+        return SPH_WORKER_URL
+    cfg = REPO_ROOT / "tools" / "wx_channel" / "config.yaml"
+    try:
+        import yaml
+        data = yaml.safe_load(cfg.read_text(encoding="utf-8")) or {}
+        host = (data.get("cloudflare") or {}).get("sphhostname") or \
+               (data.get("cloudflare") or {}).get("sphHostname") or ""
+        return str(host).rstrip("/")
+    except Exception:
+        return ""
+
+
+def extract_sph_id(url: str) -> str | None:
+    """从视频号分享链接里取出 shortUri。支持：
+    https://weixin.qq.com/sph/XXXX
+    https://channels.weixin.qq.com/finder-preview/pages/sph?id=XXXX
+    """
+    import re
+    m = re.search(r"/sph/([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    m = re.search(r"[?&]id=([A-Za-z0-9_-]+)", url)
+    if m:
+        return m.group(1)
+    return None
+
+
+class SphWorkerClient:
+    """调用已部署的 Cloudflare Worker 解析视频号分享链接。
+
+    Worker 端点是 POST /api/fetch_video_profile，透传 url，返回
+    {data:{authorInfo, feedInfo:{videoUrl, h264VideoInfo, ...}}}。
+    全程不依赖微信登录态，也不依赖本地 wx_channel 进程。
+    """
+
+    def __init__(self, base_url: str | None = None) -> None:
+        self.base_url = (base_url or _load_worker_url()).rstrip("/")
+
+    def available(self) -> bool:
+        return bool(self.base_url)
+
+    def _post(self, path: str, payload: dict, timeout: int = SPH_WORKER_TIMEOUT) -> dict:
+        req = urllib.request.Request(
+            f"{self.base_url}{path}",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json", "User-Agent": _UA},
+        )
+        try:
+            with _opener().open(req, timeout=timeout) as resp:
+                raw = resp.read().decode("utf-8", "ignore")
+                code = resp.status
+        except urllib.error.HTTPError as e:
+            raw = e.read().decode("utf-8", "ignore")
+            code = e.code
+        except Exception as e:
+            raise DownloadError(f"Worker 请求失败: {e}")
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            raise DownloadError(f"Worker 返回非 JSON: {raw[:200]}")
+        if code != 200:
+            raise DownloadError(f"Worker HTTP {code}: {data.get('error') or raw[:200]}")
+        return data
+
+    def profile(self, url: str) -> dict:
+        """解析分享链接，返回 feedInfo 风格字典（含 videoUrl / h264VideoInfo）。"""
+        data = self._post("/api/fetch_video_profile", {"url": url})
+        feed = (((data.get("data") or {}).get("feedInfo")) or {})
+        if not feed.get("videoUrl"):
+            raise DownloadError("Worker 未返回 videoUrl")
+        return feed
+
+    def video_url(self, url: str) -> str:
+        """取最优直链：优先 h264（兼容性最好），退回 videoUrl。"""
+        feed = self.profile(url)
+        h264 = (feed.get("h264VideoInfo") or {}).get("videoUrl")
+        return h264 or feed["videoUrl"]
+
+    def meta_title(self, url: str) -> str:
+        """从 Worker 响应里取一个可读标题（用于命名 md）。
+
+        优先级：作者 + 描述首行 > 描述首行 > 空。
+        描述常是「正文 #tag #tag」，取首个 `#` 或首个换行之前的部分做标题。
+        """
+        try:
+            data = self._post("/api/fetch_video_profile", {"url": url})
+        except Exception:
+            return ""
+        d = data.get("data") or {}
+        author = ((d.get("authorInfo") or {}).get("nickname") or "").strip()
+        desc = ((d.get("feedInfo") or {}).get("description") or "").strip()
+        if not desc and not author:
+            return ""
+        first = desc.split("#")[0].split("\n")[0].strip(" \t　·-—|")
+        if author and first:
+            return f"{author}：{first}"
+        return author or first
+
+    def download(self, url: str, dest_dir: Path, filename: str | None = None) -> Path:
+        """解析 + 下载到 dest_dir，返回本地 mp4 路径。"""
+        feed = self.profile(url)
+        direct = (feed.get("h264VideoInfo") or {}).get("videoUrl") or feed["videoUrl"]
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        if not filename:
+            sph_id = extract_sph_id(url) or "sph"
+            filename = f"{sph_id}.mp4"
+        target = dest_dir / filename
+        req = urllib.request.Request(direct, headers={"User-Agent": _UA})
+        with _opener().open(req, timeout=300) as resp, open(target, "wb") as f:
+            while True:
+                chunk = resp.read(1 << 20)
+                if not chunk:
+                    break
+                f.write(chunk)
+        if target.stat().st_size < 1024:
+            raise DownloadError("下载文件异常（<1KB）")
+        return target
 
 
 # ----------------------------------------------------------------------------

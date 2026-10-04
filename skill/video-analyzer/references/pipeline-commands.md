@@ -3,8 +3,8 @@
 ## 路径常量
 
 ```
-项目根:   <项目根>
-工具根:   <项目根>\tools\weixin-favor-kb
+项目根:   D:\work\2026-07-12-13-31-07
+工具根:   D:\work\2026-07-12-13-31-07\tools\weixin-favor-kb
 Python:   <工具根>\venv\Scripts\python.exe
 下载目录: <工具根>\downloads\
 输出根:   <工具根>\output\
@@ -22,7 +22,7 @@ PYTHONLEGACYWINDOWSSTDIO=utf-8
 ## 一键命令（首选）
 
 ```powershell
-Set-Location "<项目根>\tools\weixin-favor-kb"
+Set-Location "D:\work\2026-07-12-13-31-07\tools\weixin-favor-kb"
 $env:PYTHONIOENCODING="utf-8"
 & ".\venv\Scripts\python.exe" -u "auto_run.py" "<链接或文件路径>"
 ```
@@ -34,7 +34,7 @@ import subprocess
 F = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 subprocess.Popen(
     [r".\venv\Scripts\python.exe", "-u", "auto_run.py", source],
-    cwd=r"<项目根>\tools\weixin-favor-kb",
+    cwd=r"D:\work\2026-07-12-13-31-07\tools\weixin-favor-kb",
     creationflags=F, stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 ```

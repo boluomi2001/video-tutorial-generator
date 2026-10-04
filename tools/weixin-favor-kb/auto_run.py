@@ -1,9 +1,11 @@
 """一键视频分析流水线：给链接或文件，直接产出教学笔记。
 
 用法:
-    python auto_run.py "<视频号链接或本地文件路径>" [--keep] [--no-publish] [--wait-manual 30]
+    python auto_run.py "<视频号链接 / 公众号文章链接 / 本地文件路径>" [--keep] [--no-publish] [--wait-manual 30]
 
-流程: 下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
+流程:
+    视频号/文件 → 下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
+    公众号文章  → 抓取 → 保真转 Markdown（原文归档，不改写）→ 清理
 进度写入 <run_dir>/progress.json，供外部轮询。
 """
 
@@ -32,7 +34,7 @@ except Exception:
 import yaml
 from loguru import logger
 
-from modules import wx_download
+from modules import wx_article, wx_download
 from modules.analyzer import VIDEO_TYPE_PROJECT, ContentAnalyzer
 from modules.audio import extract_audio
 from modules.frames import extract_keyframes, resolve_ffmpeg
@@ -44,6 +46,8 @@ DOWNLOADS = ROOT / "downloads"
 OUTPUT = ROOT / "output"
 PROJECT_ROOT = ROOT.parent.parent
 PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "公众号视频项目"
+# 公众号文章归档的 ima 目标文件夹（知识分享类 → 功能提升教学）
+ARTICLE_FOLDER_HINT = "功能提升教学"
 
 CONFIG_DEFAULT = {
     "whisper": {"model_size": "medium", "fallback_model": "small",
@@ -123,6 +127,58 @@ def load_config() -> dict:
     return cfg
 
 
+def _sph_worker_try_download(source: str, progress: Progress) -> Path | None:
+    """用已部署的 Cloudflare Worker 云端解析+下载视频号视频。
+
+    全程不依赖微信登录态，也不依赖本地 wx_channel 进程。
+    Worker 地址取环境变量 SPH_WORKER_URL，或 wx_channel/config.yaml 的
+    cloudflare.sphhostname。未配置时静默返回 None，回落后续通道。
+    """
+    try:
+        cli = wx_download.SphWorkerClient()
+    except Exception:
+        return None
+    if not cli.available():
+        return None
+
+    try:
+        progress.update("download", 5, "云端解析中（Worker）")
+        target = cli.download(source, DOWNLOADS)
+        if target and target.exists() and target.stat().st_size > 1024:
+            # 顺带把可读标题（作者+描述）存成旁路文件，供 run_stages 命名 md
+            try:
+                mt = cli.meta_title(source)
+                if mt:
+                    target.with_suffix(".title.txt").write_text(mt, encoding="utf-8")
+            except Exception:
+                pass
+            progress.update("download", 20, f"云端解析完成 {target.name[:40]}")
+            return target
+        return None
+    except Exception as e:
+        progress.update("download", 4, f"云端解析失败（{str(e)[:60]}），转下一通道")
+        return None
+
+
+def resolve_title(video: Path, explicit: str = "") -> str:
+    """确定用于命名最终 md 的标题。
+
+    优先级：显式传入 > 下载时留下的 <stem>.title.txt > 文件名去扩展名。
+    这样视频号下载不再用 `AWEUh1CSE0` 这种无意义 ID 命名。
+    """
+    if explicit:
+        return explicit
+    sidecar = video.with_suffix(".title.txt")
+    if sidecar.exists():
+        try:
+            t = sidecar.read_text(encoding="utf-8").strip()
+            if t:
+                return t
+        except Exception:
+            pass
+    return video.stem.rsplit("_", 1)[0] if "_" in video.stem else video.stem
+
+
 def _mcp_try_download(source: str, progress: Progress) -> Path | None:
     """尝试用新版下载器的 MCP 直接下载，成功返回文件路径，失败返回 None。"""
     wx_download.ensure_downloader(wait_sec=25)  # 没在跑就静默拉起
@@ -177,7 +233,13 @@ def resolve_source(source: str, run_dir: Path, progress: Progress,
     if not source.startswith("http"):
         raise RuntimeError(f"无法识别的输入: {source}")
 
-    # 优先走新版下载器的 MCP（视频号需微信页面已连接，其他平台直接可用）
+    # ① 视频号链接：优先走云端 Worker 解析（免登录态、免本地进程、全自动）
+    if wx_download.is_sph_url(source):
+        got = _sph_worker_try_download(source, progress)
+        if got is not None:
+            return got, True
+
+    # ② 优先走新版下载器的 MCP（视频号需微信页面已连接，其他平台直接可用）
     got = _mcp_try_download(source, progress)
     if got is not None:
         return got, True
@@ -289,7 +351,7 @@ def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
         model=lcfg.get("model", "Qwen/Qwen3-VL-32B-Instruct"),
         fast_model=lcfg.get("fast_model", ""),
     )
-    title = video.stem.rsplit("_", 1)[0] if "_" in video.stem else video.stem
+    title = resolve_title(video)
     result_full = analyzer.run_full(
         transcript=transcript,
         segments=segments,
@@ -306,7 +368,8 @@ def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
 
     # ---- 输出三形态 ----
     progress.update("write", 90, "写入笔记")
-    written = write_outputs(notes_dir, result_full, title)
+    written = write_outputs(notes_dir, result_full, title,
+                            transcript=transcript, segments=segments)
 
     # ---- 清理 ----
     if not keep:
@@ -317,7 +380,123 @@ def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
     return {"result": result_full, "notes": written, "title": title}
 
 
-def write_outputs(notes_dir: Path, res: dict, title: str) -> list[str]:
+def _format_transcript(transcript: str, segments: list[dict] | None) -> list[str]:
+    """把音频文案渲染成 md 段落。
+
+    有带时间戳的分段时，输出时间轴列表（便于对照作者原话）；
+    否则退化为整段纯文本。均为空则返回空列表（调用方跳过该段）。
+    """
+    transcript = (transcript or "").strip()
+    segs = segments or []
+    timed = [s for s in segs if str(s.get("text", "")).strip()]
+    if not transcript and not timed:
+        return []
+
+    lines: list[str] = ["## 音频文案", ""]
+
+    if timed:
+        lines.append("> 以下为视频原声转录，保留说话人原话与语气，便于理解作者的完整思路。")
+        lines.append("")
+        for s in timed:
+            try:
+                st = float(s.get("start", 0) or 0)
+                ts = f"{int(st) // 60:02d}:{int(st) % 60:02d}"
+            except Exception:
+                ts = ""
+            txt = str(s.get("text", "")).strip()
+            lines.append(f"- `{ts}` {txt}" if ts else f"- {txt}")
+        lines.append("")
+    elif transcript:
+        lines.append("> 以下为视频原声转录，便于理解作者的完整思路。")
+        lines.append("")
+        lines.append(transcript)
+        lines.append("")
+
+    return lines
+
+
+def merge_notes(notes_dir: Path, res: dict, title: str,
+                transcript: str = "", segments: list[dict] | None = None) -> Path:
+    """把 tutorial / brief / checklist 三份笔记整合成一份最终 md。
+
+    结构：标题+元信息 → 速览 → 执行清单 → 详细教程正文 → 音频文案。
+    已存在的内容块不会重复拼接（例如 checklist 为空时直接省略该段）。
+    """
+    out: list[str] = []
+
+    # ---- 头部：标题 + 元信息 ----
+    vtype = res.get("video_type", "")
+    duration = res.get("duration", 0)
+    try:
+        dur = f"{int(float(duration)) // 60:02d}:{int(float(duration)) % 60:02d}"
+    except Exception:
+        dur = str(duration)
+    out += [
+        f"# {title}", "",
+        f"> 类型：{vtype} ｜ 时长：{dur} ｜ 章节：{len(res.get('chapters', []))} "
+        f"｜ 帧数：{res.get('frames_used', 0)} "
+        f"｜ 成本：¥{res.get('cost', {}).get('cost_cny', 0)}", "",
+    ]
+
+    # ---- 速览 ----
+    brief = res.get("brief") or {}
+    if brief.get("one_line") or brief.get("bullets"):
+        out += ["## 速览", ""]
+        if brief.get("one_line"):
+            out += [f"**一句话**：{brief['one_line']}", ""]
+        for b in brief.get("bullets", []):
+            out.append(f"- {b}")
+        if brief.get("who"):
+            out += ["", f"**适合谁**：{brief['who']}"]
+        out.append("")
+
+    # ---- 执行清单 ----
+    items = (res.get("checklist") or {}).get("items", [])
+    if items:
+        out += ["## 执行清单", ""]
+        for i, it in enumerate(items, 1):
+            step = it.get("step", "")
+            cmd = it.get("command", "")
+            out.append(f"- [ ] {i}. {step}")
+            if cmd:
+                out.append(f"  ```bash\n  {cmd}\n  ```")
+        out.append("")
+
+    # ---- 详细教程正文 ----
+    tutorial = (res.get("tutorial") or "").strip()
+    if tutorial:
+        # 去掉 tutorial 自身的 H1 标题行（避免与整合稿重复）
+        body_lines = tutorial.splitlines()
+        while body_lines and (not body_lines[0].strip()
+                              or body_lines[0].startswith("# ")
+                              or body_lines[0].startswith("> 类型：")):
+            body_lines.pop(0)
+        body = "\n".join(body_lines).strip()
+        if body:
+            # 正文内部标题整体降一级（## → ###），使其嵌入「详细教程」之下
+            demoted: list[str] = []
+            for ln in body.splitlines():
+                if ln.startswith("## "):
+                    demoted.append("#" + ln)
+                elif ln.startswith("### "):
+                    demoted.append("#" + ln)
+                else:
+                    demoted.append(ln)
+            out += ["---", "", "## 详细教程", "", "\n".join(demoted), ""]
+
+    # ---- 音频文案（原始口播转录，帮助理解作者原意）----
+    tlines = _format_transcript(transcript, segments)
+    if tlines:
+        out += ["---", ""]
+        out += tlines
+
+    final = notes_dir / f"{title}.md"
+    final.write_text("\n".join(out).rstrip() + "\n", encoding="utf-8")
+    return final
+
+
+def write_outputs(notes_dir: Path, res: dict, title: str,
+                  transcript: str = "", segments: list[dict] | None = None) -> list[str]:
     written: list[str] = []
 
     tutorial = notes_dir / "tutorial.md"
@@ -348,19 +527,66 @@ def write_outputs(notes_dir: Path, res: dict, title: str) -> list[str]:
     (notes_dir / "checklist.md").write_text("\n".join(cl), encoding="utf-8")
     written.append(str(notes_dir / "checklist.md"))
 
+    # ---- 整合成最终单文件 md（三段合一 + 音频文案）----
+    final = merge_notes(notes_dir, res, sanitize(title, 60),
+                        transcript=transcript, segments=segments)
+    written.append(str(final))
+
     (notes_dir / "raw.json").write_text(
         json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8"
     )
     return written
 
 
+def write_ima_pending(notes_dir: Path, final_md: Path, res: dict,
+                      title: str) -> Path:
+    """写一份待上传清单，供 Agent 用 ima MCP 上传 + 校验 + 删本地。
+
+    流水线自身不能调 ima MCP（该 MCP 只注入 Agent 会话，不是本地服务），
+    因此产出此清单，由 Agent 按 SKILL.md 的 SOP 执行。
+    """
+    sub = "项目复刻教学" if res.get("video_type") == VIDEO_TYPE_PROJECT else "功能提升教学"
+    manifest = {
+        "final_md": str(final_md),
+        "title": final_md.name,
+        "knowledge_base_id": "001a8016b30037f0",
+        "folder_hint": sub,
+        "delete_local_after_verify": True,
+        "notes_dir": str(notes_dir),
+        "intermediate": [
+            str(notes_dir / "tutorial.md"),
+            str(notes_dir / "brief.md"),
+            str(notes_dir / "checklist.md"),
+        ],
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    p = notes_dir / ".ima_pending.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
 def publish(res: dict, title: str, notes: list[str]) -> list[str]:
     """把笔记同步到项目 outputs 目录。"""
+    if res.get("source_type") == "article":
+        # 文章归档：目录单独归类，文件名原样（标题已在文件名里）
+        dest_dir = PROJECT_ROOT / "outputs" / "公众号文章"
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out: list[str] = []
+        for src in notes:
+            p = Path(src)
+            if p.name == "raw.json":
+                continue
+            target = dest_dir / p.name
+            shutil.copy2(p, target)
+            out.append(str(target))
+        return out
+
     sub = "项目复刻教学" if res["video_type"] == VIDEO_TYPE_PROJECT else "功能提升教学"
     dest_dir = PUBLISH_ROOT / sub
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = sanitize(title, 60)
-    out: list[str] = []
+    out = []
     for src in notes:
         p = Path(src)
         if p.name == "raw.json":
@@ -391,11 +617,83 @@ def cleanup(video: Path | None, run_dir: Path, files: list[Path], dirs: list[Pat
             log(f"已删除源视频 {video.name}")
         except Exception as e:
             log(f"删除源视频失败: {e}")
+        # 一并清掉下载时留下的标题旁路文件
+        sidecar = video.with_suffix(".title.txt")
+        try:
+            if sidecar.exists():
+                sidecar.unlink()
+        except Exception:
+            pass
+
+
+def run_article(url: str, run_dir: Path, progress: Progress) -> dict:
+    """公众号文章通道：抓取 → 保真转 Markdown（原文归档，不改写）。
+
+    与视频通道不同：不做转录/抽帧/分析，正文即最终交付物。
+    """
+    notes_dir = run_dir / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+
+    progress.update("fetch", 15, "抓取公众号文章")
+    info = wx_article.fetch(url)
+    log(f"文章：{info['title'][:60]}（{info['account']}）")
+
+    progress.update("convert", 70, "保真转换 Markdown")
+    md = wx_article.to_markdown(info)
+
+    final = notes_dir / wx_article.filename_for(info["title"])
+    final.write_text(md, encoding="utf-8")
+
+    # 顺带存原始 HTML，便于复核/重转（中间产物）
+    try:
+        (run_dir / "article_raw.html").write_text(info["raw_html"], encoding="utf-8")
+    except Exception:
+        pass
+
+    res = {
+        "video_type": "公众号文章",
+        "source_type": "article",
+        "title": info["title"],
+        "account": info["account"],
+        "author": info["author"],
+        "publish_time": info["publish_time"],
+        "url": url,
+        "duration": 0,
+        "chapters": [],
+        "frames_used": 0,
+        "cost": {"cost_cny": 0},
+        "elapsed_sec": 0,
+    }
+    progress.update("write", 90, "写入归档 md")
+    log(f"归档完成：{final}")
+    return {"result": res, "notes": [str(final)], "title": info["title"]}
+
+
+def write_article_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
+    """公众号文章的 ima 待上传清单（无正文改写，folder 归入项目复刻教学）。"""
+    manifest = {
+        "final_md": str(final_md),
+        "title": final_md.name,
+        "knowledge_base_id": "001a8016b30037f0",
+        "folder_hint": ARTICLE_FOLDER_HINT,
+        "source_type": "article",
+        "source_url": res.get("url", ""),
+        "account": res.get("account", ""),
+        "author": res.get("author", ""),
+        "delete_local_after_verify": True,
+        "notes_dir": str(notes_dir),
+        "intermediate": [str(notes_dir.parent / "article_raw.html")],
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    p = notes_dir / ".ima_pending.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("source", help="视频号链接 / 直链 / 本地文件路径")
+    ap.add_argument("source", help="视频号链接 / 公众号文章链接 / 直链 / 本地文件路径")
     ap.add_argument("--keep", action="store_true", help="保留视频与中间文件")
     ap.add_argument("--no-publish", action="store_true", help="不复制到项目 outputs 目录")
     ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
@@ -403,8 +701,12 @@ def main() -> int:
 
     cfg = load_config()
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    name = sanitize(Path(args.source).stem if not args.source.startswith("http")
-                    else "sph_video", 30)
+    is_article = wx_article.is_article_url(args.source)
+    if is_article:
+        name = "wechat_article"
+    else:
+        name = sanitize(Path(args.source).stem if not args.source.startswith("http")
+                        else "sph_video", 30)
     run_dir = OUTPUT / f"{ts}_{name}"
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "_run_id.txt").write_text(f"{ts}_{name}", encoding="utf-8")
@@ -414,6 +716,28 @@ def main() -> int:
     is_temp = False
 
     try:
+        # ---------- 公众号文章通道 ----------
+        if is_article:
+            progress.update("init", 2, f"公众号文章 {args.source[:80]}")
+            out = run_article(args.source, run_dir, progress)
+            res = out["result"]
+            notes = out["notes"]
+            if not args.no_publish:
+                notes += publish(res, out["title"], notes)
+            final_md = Path(notes[0])
+            pending = write_article_pending(final_md.parent, final_md, res)
+            progress.finish(notes)
+            log("=" * 50)
+            log(f"完成！公众号文章「{res['account']}」发布的《{res['title'][:40]}》")
+            for n in notes:
+                log(f"  {n}")
+            log("-" * 50)
+            log(f"最终交付物: {final_md}")
+            log(f"待上传清单: {pending}")
+            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
+            return 0
+
+        # ---------- 视频通道 ----------
         progress.update("init", 2, f"开始处理 {args.source[:80]}")
         video, is_temp = resolve_source(args.source, run_dir, progress, args.wait_manual)
         out = run_stages(video, is_temp, cfg, run_dir, progress, keep=args.keep)
@@ -423,6 +747,15 @@ def main() -> int:
         if not args.no_publish:
             notes += publish(res, out["title"], notes)
 
+        # 写 ima 待上传清单（最终交付物 = 整合后的单文件 md）
+        final_md = next((Path(n) for n in notes
+                         if Path(n).name.endswith(".md")
+                         and Path(n).name not in ("tutorial.md", "brief.md",
+                                                  "checklist.md")), None)
+        pending = None
+        if final_md:
+            pending = write_ima_pending(final_md.parent, final_md, res, out["title"])
+
         progress.finish(notes)
         log("=" * 50)
         log(f"完成！类型={res['video_type']} 章节={len(res['chapters'])} "
@@ -430,6 +763,11 @@ def main() -> int:
             f"耗时={res['elapsed_sec']}s")
         for n in notes:
             log(f"  {n}")
+        if final_md:
+            log("-" * 50)
+            log(f"最终交付物: {final_md}")
+            log(f"待上传清单: {pending}")
+            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
         return 0
 
     except Exception as e:

@@ -1,5 +1,42 @@
 # 更新日志
 
+## v0.3.0 —— 2026-10-04
+
+**云端解析免登录 + 公众号文章通道 + 单文件整合稿 + ima 自动上传**
+
+### 新增
+
+- **视频号云端解析通道**：`modules/wx_download.py` 新增 `SphWorkerClient`，
+  经 Cloudflare Worker 调用微信 `get_feed_info` 接口（**免鉴权**）拿未加密直链，
+  **无需登录微信、无需本地下载器进程**，2-5 秒出直链；支持 `SPH_WORKER_URL` 覆盖
+- **公众号文章通道**：`modules/wx_article.py`，抓取 `mp.weixin.qq.com/s/...` 文章并
+  **保真转为 Markdown**（只还原结构、不改写一字）；`auto_run.py` 按链接类型自动分流
+- **单文件整合稿**：`merge_notes()` 把 tutorial / brief / checklist 三合一，并追加
+  **音频文案段**（视频原声逐句转录，带 `mm:ss` 时间戳）
+- **可读文件命名**：整合稿改用 `{作者}：{描述}` 命名，不再用分享 ID
+  （取 `SphWorkerClient.meta_title()`，三级兜底）
+- **ima 自动上传**：`modules/ima_upload.py`（create_media → COS PUT → add_knowledge），
+  每次产出写 `.ima_pending.json` 待上传清单
+- `docs/prompts.md`：提示词合集
+
+### 改进
+
+- 视频号下载优先级改为 **① 云端 Worker（免登录）→ ② 本地 MCP → ③ wx_channel 服务/手动**
+- `requirements.txt` 新增 `cos-python-sdk-v5`（ima COS 上传依赖）
+- `.gitignore` 新增 `.backups/`
+- Skill 文档大幅扩充（云端解析、整合稿、ima 上传 SOP、公众号文章通道）
+
+### 修复
+
+- `wx_download.py` 第 28 行 `DOWNLOADER_DIR` 未导入（NameError，会让整个下载层 import 即崩）
+
+### 约定（硬约束）
+
+- **只有 ima 回读校验命中（title 或 media_id 一致）才能删本地 md**
+- ima MCP 无删除接口，重复上传会遗留旧条目，需人工清理
+
+---
+
 ## v0.2.0 —— 2026-09-19
 
 **一键安装 + 隐私脱敏 + 路径无关化**
