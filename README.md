@@ -74,11 +74,16 @@
 | 原则 | 做法 |
 |---|---|
 | 本地优先 | 转录与抽帧全在本地跑，只有语义理解调云端模型 |
-| 免登录 | 视频号走云端解析通道，不需打开微信（旧通道仍保留兜底） |
+| 免登录 | 视频号走云端解析通道，不需打开微信（**需先部署一次 Worker，见 §3.7**；未部署会自动回落旧通道） |
 | 便宜 | 视频单次全流程约 **¥0.1**（2 分钟视频）；文章通道 **0 成本** |
 | 抗超时 | 各阶段独立失败降级，不会一步崩全盘 |
 | 免人工 | 视频号可全自动；其他平台偶需打开微信 |
 | 可归档 | 产出自动上传 ima 知识库，回读校验通过后才删本地 |
+
+> ⚠️ **关于「云端解析」的重要前提**：视频号免登录解析依赖一个**自己的 Cloudflare Worker**，
+> 它是**一次性部署**的，不属于开箱即用。仓库出于安全考虑**不含**该 Worker 的凭据与配置。
+> 不部署也能用，但视频号会退回「下载器 + 微信内解密」通道（需要开着微信、且仅 Windows）。
+> 部署步骤见 **§3.7**。
 
 ---
 
@@ -273,13 +278,92 @@ mcp:
   enabled: true        # 必须开，Agent 靠它调下载能力
 ```
 
-### 3.7 Step 6 —— 跑通第一个视频
+### 3.7 Step 6 ——（可选，强烈推荐）部署云端解析 Worker
+
+**为什么需要这一步？**
+
+视频号的视频是加密的，只有在微信里才能解密。为了做到「不用打开微信也能下载」，本项目使用一条**云端解析**通道：一个跑在 Cloudflare 上的 Worker 调用微信官方免鉴权接口 `get_feed_info`，直接拿到**未加密直链**，再透传给你。全程不碰登录态。
+
+这个 Worker 需要**你自己的 Cloudflare 账号**，所以**必须自己部署一次** —— 仓库里不含它（也不该含，因为要填 API Token）。
+
+> **不部署可以吗？** 可以。程序会自动回落到「下载器 + 微信内解密」通道，
+> 但那条路要求**开着电脑版微信并停在视频号页面**，且**只有 Windows**。
+> 想省掉这些麻烦，就花 5 分钟部署一次。
+
+**前置：** 一个免费的 [Cloudflare](https://dash.cloudflare.com) 账号。
+
+**第一步：创建 API Token**
+
+Cloudflare 控制台 → 右上角头像 → **My Profile** → **API Tokens** → **Create Token** → 选 **Edit Cloudflare Workers** 模板 → 创建并复制 Token。
+
+再记下 **Account ID**（控制台右侧栏，或 Workers 页面 URL 里那串十六进制）。
+
+**第二步：填配置**
+
+复制模板并填写：
+
+```powershell
+copy tools\wx_channel\config.example.yaml tools\wx_channel\config.yaml
+```
+
+```yaml
+# tools/wx_channel/config.yaml
+cloudflare:
+  accountid: "你的 Account ID"
+  apitoken: "上一步创建的 API Token"
+  sphcookie: "dash.cloudflare.com 的 cookie"   # 见下方说明
+  sphhostname: ""    # 留空，部署成功后自动回填
+  sphworkername: "sph-parse"
+```
+
+> **sphcookie 怎么拿**：登录 dash.cloudflare.com，按 F12 打开开发者工具 →
+> Network 标签 → 刷新页面 → 随便点一个发往 `api.cloudflare.com` 的请求 →
+> 在 Request Headers 里复制整条 `cookie` 值。
+>
+> ⚠️ **坑（踩过）**：这条 cookie 里常含英文双引号（如 `curr-account={"xxx"}`），
+> 用双引号包裹会让 YAML 解析失败，导致整个 `cloudflare` 段静默失效。
+> **务必用单引号**，或用块标量 `>-` 折行写。
+
+**第三步：执行部署**
+
+```powershell
+cd tools\wx_channel
+.\wx_channel.exe sph_deploy --config config.yaml
+```
+
+> ⚠️ **坑（踩过）**：CLI 默认去读 `$HOME/.wx_channel/config.yaml`，
+> **必须**加 `--config config.yaml` 指向程序目录里的配置，否则会静默走默认值。
+
+部署成功后 `sphhostname` 会被自动回填（例如 `https://sph-parse.你的子域.workers.dev`），流水线会**自动读取**它，无需再改任何代码。
+
+**验证：**
+
+```powershell
+# 把 <你的域名> 换成回填后的 sphhostname
+curl -X POST "https://<你的域名>/api/fetch_video_profile" ^
+  -H "Content-Type: application/json" ^
+  -d "{\"url\":\"https://weixin.qq.com/sph/XXXXXXXX\"}"
+```
+
+返回 JSON 里含 `videoUrl` 即部署成功。
+
+**其他部署方式 / 备注：**
+
+| 项 | 说明 |
+|---|---|
+| 手动改地址 | 也可用环境变量 `SPH_WORKER_URL` 覆盖，优先级高于配置文件 |
+| workers.dev 被污染 | 中国大陆部分网络可能连不上 `*.workers.dev`，可给 Worker 绑一个自己的自定义域名 |
+| 重新部署 | 重复执行上面的 `sph_deploy` 命令即可 |
+| 可靠性 | Worker 跑在你的账号下，与作者无关，长期可用性由你自己控制 |
+
+### 3.8 Step 7 —— 跑通第一个视频
 
 ```powershell
 # 方式 A（推荐，免登录）：直接丢视频号链接，云端解析
+#   —— 需要先完成 Step 6 的 Worker 部署
 tools\weixin-favor-kb\run_auto.cmd "https://weixin.qq.com/sph/XXXXXXXX"
 
-# 方式 B（兜底）：云端不可用时，启动下载器 + 打开微信视频号页面
+# 方式 B（兜底）：未部署 Worker，或云端不可用时
 tools\wx_channels_download\wx_video_download.exe
 # 打开电脑版微信，随便进到一个视频号页面，让微信保持运行
 tools\weixin-favor-kb\run_auto.cmd "https://channels.weixin.qq.com/..."
@@ -311,12 +395,15 @@ tools\weixin-favor-kb\run_auto.cmd "D:\我的视频\demo.mp4"
 | ffmpeg | 6.x / 8.x essentials | ✅ | 抽音频、抽帧 | `winget install Gyan.FFmpeg` |
 | 硅基流动 API Key | — | ✅ | 视觉理解与生成 | cloud.siliconflow.cn |
 | wx_video_download | v260907+ | 其他平台/兜底 | MCP 下载服务（端口 2022） | 仓库 `installer/` 内置 |
+| wx_channel | v5.6.9+ | 云端解析需要 | 部署 Cloudflare Worker（见 §3.7） | 自行获取（第三方工具） |
+| Cloudflare 账号 | 免费版即可 | 云端解析需要 | 托管解析 Worker | dash.cloudflare.com |
 | 微信 PC 客户端 | 新版 | 仅兜底 | 提供解密环境 | pc.weixin.qq.com |
 | Windows | 10 / 11 | 推荐 | 下载器只有 Windows 发行包 | — |
 | NVIDIA GPU + CUDA | — | 可选 | 转录提速 5-10 倍 | 配 `device: cuda` |
 
 > **视频号已支持云端解析**：不需要打开微信、不需要本地下载器进程，免登录直接拿直链。
-> 微信 PC 客户端与下载器仅在云端通道不可用时作为兜底。
+> **但这条通道需要你自己部署一次 Worker**（见 **§3.7**），仓库不含其凭据与配置。
+> 未部署时，微信 PC 客户端与下载器即为兜底方案。
 
 Python 依赖（`requirements.txt`）：
 
@@ -477,7 +564,17 @@ tools\weixin-favor-kb\
 
 **Q：处理视频号还需要开着微信吗？**
 通常不需要。视频号已支持**云端解析**通道 —— 免登录、免本地下载器进程，几秒拿直链。
-只有当云端通道不可用（如服务未部署）时，才回落到「下载器 + 微信内解密」这条老路。
+
+**但这个通道不是开箱即用的**：它依赖一个部署在你**自己的 Cloudflare 账号**下的 Worker，
+需要按 **§3.7** 一次性配置（约 5 分钟）。仓库出于安全考虑不含该 Worker 的配置与凭据。
+
+没有部署的话，程序会自动回落到「下载器 + 微信内解密」这条老路，
+需要**开着电脑版微信并停在视频号页面**，且**仅 Windows 可用**。
+
+**Q：为什么仓库里没有 `tools/wx_channel/` 这个目录？**
+因为它里面装着**你的** Cloudflare Account ID、API Token 和 cookie，
+属于敏感凭据，已被 `.gitignore` 排除，**绝不入库**。
+使用者需要自己放一份 `wx_channel.exe` 并按 §3.7 生成 `config.yaml`。
 
 **Q：公众号文章会被 AI 改写吗？**
 不会。文章走独立通道，**只做原文归档**，仅还原标题/加粗/列表/配图等格式，一个字都不改。
@@ -583,6 +680,8 @@ video-tutorial-generator/
 │   │   │   ├── wx_article.py    #   公众号文章抓取 + 保真转 Markdown
 │   │   │   └── ima_upload.py    #   ima 知识库上传 / 校验
 │   │   └── config.example.yaml  # 配置模板
+│   ├── wx_channel/              # 云端解析部署工具（需自行获取 wx_channel.exe）
+│   │   └── config.example.yaml  #    Worker 凭据模板（真实 config.yaml 不入库）
 │   ├── wx_channels_download/    # 下载器（setup 解压生成）
 │   └── ffmpeg/                  # ffmpeg（可选，或装到 PATH）
 └── outputs/                     # 笔记发布目录（本地生成，不入库）

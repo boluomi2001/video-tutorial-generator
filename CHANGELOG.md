@@ -1,5 +1,37 @@
 # 更新日志
 
+## v0.3.1 —— 2026-10-04
+
+**文档补漏：明确「云端解析需自部署 Worker」+ 补齐部署模板**
+
+### 修复
+
+- **README 从未说明云端解析需要自部署 Cloudflare Worker**，读者会误以为开箱即用。
+  实际上 `tools/wx_channel/` 整个被 `.gitignore` 排除（含凭据与域名配置），
+  克隆仓库后云端通道必然不可用，只能降级到需开微信的旧通道。现已补齐完整说明。
+- `scripts/setup.py` 收尾提示把「打开微信进视频号页面」写成必做步骤，
+  事实是仅兜底通道需要；现改为**双通道并列表述**，推荐路径为部署 Worker。
+
+### 新增
+
+- `tools/wx_channel/config.example.yaml`：Worker 部署所需配置模板
+  （含 `accountid` / `apitoken` / `sphcookie` / `sphhostname` 及两处 YAML 坑位注释）
+- README **§3.7 Step 6「部署云端解析 Worker」**：完整四步（建 Token → 填配置 →
+  `sph_deploy` → 验证），含 cookie 双引号坑与 `--config` 路径坑
+- README 新增 FAQ 两条：为何需要部署、为何仓库里没有 `tools/wx_channel/`
+
+### 改进
+
+- 设计原则表、工具清单、FAQ 中所有「免登录」表述补充**前置条件**，
+  不再暗示零配置可用
+- `.gitignore` 规则细化：`tools/wx_channel/*` + 负向规则保留 `config.example.yaml`，
+  真实 `config.yaml` / `wx_channel.exe` / 设备指纹仍被排除
+- 两份 SKILL.md 的云端解析章节开头补「前置条件」警告，
+  并说明未部署时的自动降级路径（功能不中断）
+- README 目录结构补 `tools/wx_channel/` 条目
+
+---
+
 ## v0.3.0 —— 2026-10-04
 
 **云端解析免登录 + 公众号文章通道 + 单文件整合稿 + ima 自动上传**

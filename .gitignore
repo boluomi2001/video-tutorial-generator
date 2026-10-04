@@ -16,7 +16,9 @@ tools/wx_channels_download*/cache/
 tools/wx_channels_download*/logs/
 tools/wx_channels_download*/downloads/
 tools/wx_channels_download_v260907/
-tools/wx_channel/
+tools/wx_channel/*
+# 保留配置模板（不含任何真实凭据，供使用者复制后自行填写）
+!tools/wx_channel/config.example.yaml
 _probe.txt
 
 # ============================================

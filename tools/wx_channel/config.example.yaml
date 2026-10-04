@@ -1,0 +1,36 @@
+# ============================================================
+# wx_channel 配置模板
+# 用途：部署「云端解析」Cloudflare Worker（视频号免登录直链）
+#
+# 使用方法：
+#   1. copy tools\wx_channel\config.example.yaml tools\wx_channel\config.yaml
+#   2. 填入下方 cloudflare 段的 accountid / apitoken / sphcookie
+#   3. cd tools\wx_channel && .\wx_channel.exe sph_deploy --config config.yaml
+#
+# ⚠️ 真实 config.yaml 含凭据，已被 .gitignore 排除，请勿提交
+# 详细步骤见 README.md §3.6
+# ============================================================
+
+cloudflare:
+  # Cloudflare Account ID —— 控制台右侧栏，或 Workers 页面 URL 里的十六进制串
+  accountid: ""
+
+  # API Token —— My Profile → API Tokens → Create Token
+  # 选择「Edit Cloudflare Workers」模板
+  apitoken: ""
+
+  # dash.cloudflare.com 的 cookie（F12 → Network → 任一 api.cloudflare.com 请求 → Request Headers）
+  # ⚠️ 坑：该 cookie 常含英文双引号，用双引号包裹会导致 YAML 解析失败、
+  #        整个 cloudflare 段静默失效。请务必用单引号，或用块标量 >- 折行。
+  sphcookie: ''
+
+  # 部署成功后由 sph_deploy 自动回填，留空即可（勿手填）
+  sphhostname: ""
+
+  # Worker 名称，可自定义
+  sphworkername: "sph-parse"
+
+# 以下为本地服务设置，一般无需修改
+compression_enabled: true
+compression_threshold: 1024
+default_port: 2025

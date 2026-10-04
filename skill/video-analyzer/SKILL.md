@@ -116,6 +116,13 @@ subprocess.Popen(
 
 ### 云端解析（Cloudflare Worker）— 视频号推荐通道
 
+> ⚠️ **前置条件（不是开箱即用）**：这条通道依赖一个部署在**使用者自己的
+> Cloudflare 账号**下的 Worker。仓库**不含**该 Worker 的配置与凭据
+> （`tools/wx_channel/config.yaml` 已被 `.gitignore` 排除）。
+> 未部署时，`SphWorkerClient.available()` 返回 False，`auto_run.resolve_source()`
+> 会自动降级到「本地 MCP → wx_channel 服务 / 等待手动」，功能不中断。
+> 给用户解释时务必说明「需自己部署一次」，不要承诺开箱即用。
+
 **原理**：Worker 持有视频号解析逻辑，收到分享链接后调用微信
 `channels.weixin.qq.com/finder-preview/api/feed/get_feed_info`（该接口免鉴权），
 拿到 `videoUrl`（未加密直链）后直接透传。**不需要微信登录态，不需要本地进程。**
