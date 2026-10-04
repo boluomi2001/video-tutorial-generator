@@ -69,3 +69,6 @@ Thumbs.db
 
 # 本地备份目录
 .backups/
+
+# 发布产物（本地留档，已上传到 GitHub Releases）
+_release_assets/
