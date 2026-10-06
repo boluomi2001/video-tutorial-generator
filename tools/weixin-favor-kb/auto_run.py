@@ -59,7 +59,7 @@ from loguru import logger
 from modules import wx_article, wx_download
 from modules.analyzer import VIDEO_TYPE_PROJECT, ContentAnalyzer
 from modules.audio import extract_audio
-from modules.frames import extract_keyframes, resolve_ffmpeg
+from modules.frames import build_contact_sheet, extract_keyframes, resolve_ffmpeg
 from modules.ocr import OCRProcessor
 from modules.transcribe import Transcriber
 
@@ -306,7 +306,9 @@ def resolve_source(source: str, run_dir: Path, progress: Progress,
 
 
 def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
-               progress: Progress, keep: bool) -> dict:
+               progress: Progress, keep: bool,
+               facts_only: bool = False, source: str = "",
+               local_only: bool = False) -> dict:
     transcripts_dir = run_dir / "transcripts"
     frames_dir = run_dir / "frames"
     notes_dir = run_dir / "notes"
@@ -365,39 +367,73 @@ def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
         ocr_items.append((float(ts), txt.strip()))
 
     # ---- 分析 ----
-    progress.update("analyze", 60, "视觉理解 + 事实抽取")
-    lcfg = cfg["llm"]
-    analyzer = ContentAnalyzer(
-        api_key=lcfg.get("api_key", ""),
-        base_url=lcfg.get("base_url", ""),
-        model=lcfg.get("model", "Qwen/Qwen3-VL-32B-Instruct"),
-        fast_model=lcfg.get("fast_model", ""),
-    )
     title = resolve_title(video)
-    result_full = analyzer.run_full(
-        transcript=transcript,
-        segments=segments,
-        frames=frame_paths,
-        frames_meta=frames_meta,
-        ocr_items=ocr_items,
-        title=title,
-        duration=float(frames_meta.get("duration", 0) or 0),
-        output_dir=str(notes_dir),
-    )
-    progress.update("analyze", 85,
-                    f"分析完成 类型={result_full['video_type']} "
-                    f"成本=¥{result_full['cost']['cost_cny']}")
+    if local_only:
+        # 纯本地模式：不调用任何 LLM API。
+        # 视觉理解（看画面）与写笔记全部交给 Agent —— 流水线只负责产出干净素材：
+        # 转录 + 关键帧 + 本地 OCR + 缩略图拼版。
+        progress.update("analyze", 85, "纯本地：跳过 LLM（视觉/事实交给 Agent）")
+        result_full = {
+            "title": title,
+            "video_type": "",            # 由 Agent 判定
+            "domain": "",
+            "duration": round(float(frames_meta.get("duration", 0) or 0), 1),
+            "chapters": [],
+            "facts": {},
+            "tutorial": "",
+            "brief": {},
+            "checklist": {},
+            "quality": {},
+            "frames_used": len(frame_paths),
+            "cost": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                     "cost_cny": 0.0},
+            "elapsed_sec": 0,
+            "facts_only": True,
+            "local_only": True,
+        }
+    else:
+        progress.update("analyze", 60, "视觉理解 + 事实抽取")
+        lcfg = cfg["llm"]
+        analyzer = ContentAnalyzer(
+            api_key=lcfg.get("api_key", ""),
+            base_url=lcfg.get("base_url", ""),
+            model=lcfg.get("model", "Qwen/Qwen3-VL-32B-Instruct"),
+            fast_model=lcfg.get("fast_model", ""),
+        )
+        result_full = analyzer.run_full(
+            transcript=transcript,
+            segments=segments,
+            frames=frame_paths,
+            frames_meta=frames_meta,
+            ocr_items=ocr_items,
+            title=title,
+            duration=float(frames_meta.get("duration", 0) or 0),
+            output_dir=str(notes_dir),
+            facts_only=facts_only,
+        )
+        progress.update("analyze", 85,
+                        f"分析完成 类型={result_full['video_type']} "
+                        f"成本=¥{result_full['cost']['cost_cny']}")
 
-    # ---- 输出三形态 ----
-    progress.update("write", 90, "写入笔记")
-    written = write_outputs(notes_dir, result_full, title,
-                            transcript=transcript, segments=segments)
+    # ---- 输出 ----
+    if facts_only:
+        # Agent 模式：只落地干净源（转录 + 事实 + OCR 画面文字），
+        # 不生成 Qwen 版笔记（tutorial/brief/checklist），也不做整合稿。
+        progress.update("write", 90, "落地干净源（Agent 模式）")
+        written = write_agent_input(notes_dir, run_dir, result_full, title,
+                                    transcript, segments, ocr_items, source)
+    else:
+        progress.update("write", 90, "写入笔记")
+        written = write_outputs(notes_dir, result_full, title,
+                                transcript=transcript, segments=segments)
 
     # ---- 清理 ----
     if not keep:
         progress.update("cleanup", 95, "清理中间文件")
+        # Agent 模式保留 frames：便于回溯"画面文字从哪来"，也让 Agent 可按需看图
+        dirs = [] if facts_only else [frames_dir]
         cleanup(video if is_temp else None, run_dir,
-                files=[audio_path], dirs=[frames_dir])
+                files=[audio_path], dirs=dirs)
 
     return {"result": result_full, "notes": written, "title": title}
 
@@ -588,6 +624,132 @@ def write_ima_pending(notes_dir: Path, final_md: Path, res: dict,
     return p
 
 
+def write_agent_input(notes_dir: Path, run_dir: Path, res: dict, title: str,
+                      transcript: str, segments: list[dict] | None,
+                      ocr_items: list[tuple[float, str]] | None,
+                      source: str = "") -> list[str]:
+    """Agent 模式：只落地「干净源」——转录 + 结构化事实 + 画面文字(OCR)。
+
+    刻意**不写** tutorial/brief/checklist，也不做整合稿：Qwen 的注水产物一旦
+    混进输入就会把 Agent 带偏。取数约定直接写进本文件，避免口头约定失效。
+    """
+    tdir = run_dir / "transcripts"
+    tpath = next(iter(sorted(tdir.glob("*.txt"))), None)
+    spath = next(iter(sorted(tdir.glob("*_segments.json"))), None)
+    frames_dir = run_dir / "frames"
+    frames = (sorted(str(p) for p in frames_dir.glob("keyframe_*.jpg"))
+              if frames_dir.is_dir() else [])
+
+    # 缩略图拼版：把全部关键帧拼成一张图，Agent 读一张即可纵览全片画面
+    contact_sheet = ""
+    if frames:
+        try:
+            contact_sheet = build_contact_sheet(
+                frames, frames_dir / "contact_sheet.jpg") or ""
+        except Exception as e:
+            log(f"缩略图拼版失败（不影响主流程）: {e}")
+
+    # 本地可得的两个"画面/文字"信号，供 Agent 自适应决定要不要看单帧
+    meta: dict = {}
+    meta_file = frames_dir / "frames_meta.json"
+    if meta_file.is_file():
+        try:
+            meta = json.loads(meta_file.read_text(encoding="utf-8"))
+        except Exception:
+            meta = {}
+    n_ocr = len(ocr_items or [])
+    ocr_chars = sum(len(t) for _, t in (ocr_items or []))
+
+    payload = {
+        "mode": "agent_write",
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "title": title,
+        "source_url": source,
+        "video_type": res.get("video_type", ""),
+        "domain": res.get("domain", ""),
+        "duration": res.get("duration", 0),
+        "chapters_hint": res.get("chapters", []),
+        "facts": res.get("facts", {}),
+        "transcript": transcript,
+        "transcript_path": str(tpath) if tpath else "",
+        "segments_path": str(spath) if spath else "",
+        "ocr": [{"t": round(float(t), 1), "text": txt}
+                for t, txt in (ocr_items or [])],
+        "frames_dir": str(frames_dir) if frames else "",
+        "frames": frames,
+        "contact_sheet": contact_sheet,
+        "frame_profile": meta.get("profile", {}),
+        "ocr_stats": {
+            "frames": n_ocr,
+            "chars": ocr_chars,
+            "chars_per_frame": round(ocr_chars / max(n_ocr, 1), 1),
+        },
+        "agent_rules": {
+            "read_only": ["facts", "transcript", "segments_path", "ocr",
+                          "chapters_hint", "contact_sheet", "frames"],
+            "never_read": [
+                "notes/tutorial.md / brief.md / checklist.md",
+                "notes/raw.json 的 tutorial/brief/checklist 字段",
+                "任何已成型的整合稿 md",
+            ],
+            "note": ("先看 contact_sheet（全片关键帧缩略拼版，每格标了时间戳）纵览画面；"
+                     "只在需要看清某屏时才读 frames/ 里的单帧原图。"
+                     "笔记结构按本条视频内容自定；音频文案取自 segments（带 mm:ss），原样保留。"),
+            "adapt_rule": (
+                "按内容自适应。注意：frame_profile / ocr_stats 是本地机器算出的**参考信号**，"
+                "可能失准（例：彩色打光下人脸检测会漏检、字幕多的口播会被判成 code）——"
+                "**以你在 contact_sheet 里实际看到的画面为准**。"
+                "① 文稿/PPT/代码/图表类（ocr_stats.chars_per_frame 偏高，如 >150）"
+                "→ 画面文字已在 ocr 里，一般无需再看单帧；"
+                "② 实物/场景/3D/审美/操作演示类（chars_per_frame 偏低）→ 按需读 frames/ 中"
+                "对应时间戳的原帧，看清画面细节；"
+                "③ 纯口播类（画面只有人脸）→ 画面无信息，只写转录内容。"
+            ),
+        },
+    }
+    p = notes_dir / "agent_input.json"
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+
+    # raw.json 仍留一份便于回溯（Agent 模式下 tutorial 为空，不构成污染）
+    (notes_dir / "raw.json").write_text(
+        json.dumps(res, ensure_ascii=False, indent=2), encoding="utf-8")
+    return [str(p)]
+
+
+AGENT_FOLDER_ID = "folder_7512859667859656"   # ima「大李老师」（2026-10-06 重建）
+
+
+def write_agent_pending(notes_dir: Path, res: dict, title: str,
+                        agent_input: Path, source: str = "") -> Path:
+    """Agent 模式的待办清单：不是「待上传 md」，而是「待 Agent 写笔记」。"""
+    sub = ("项目复刻教学" if res.get("video_type") == VIDEO_TYPE_PROJECT
+           else "功能提升教学")
+    manifest = {
+        "mode": "agent_write",
+        "agent_input": str(agent_input),
+        "title": title,
+        "knowledge_base_id": "001a8016b30037f0",
+        "folder_hint": sub,
+        "folder_id": AGENT_FOLDER_ID,
+        "source_url": source,
+        "delete_local_after_verify": True,
+        "notes_dir": str(notes_dir),
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "agent_steps": [
+            "读 agent_input.json 的 facts / transcript / ocr（禁止读任何 *.md）",
+            "按视频内容自定笔记结构（观点 / 操作 / 科普 / 方法 / 工具 / 随笔 …）",
+            "音频文案取自 segments（带 mm:ss），原样保留",
+            "写出的 md 存到 outputs/_新版笔记/",
+            f"上传 ima「大李老师」({AGENT_FOLDER_ID}) → 回读校验 → 命中后删本地",
+        ],
+    }
+    p = notes_dir / ".agent_pending.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
 def publish(res: dict, title: str, notes: list[str]) -> list[str]:
     """把笔记同步到项目 outputs 目录。"""
     if res.get("source_type") == "article":
@@ -714,7 +876,8 @@ def write_article_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
 
 
 def run_one(source: str, no_publish: bool = False, keep: bool = False,
-            wait_manual: int = 30, ts: str | None = None) -> dict:
+            wait_manual: int = 30, ts: str | None = None,
+            agent_write: bool = False, local_only: bool = False) -> dict:
     """处理单条输入（视频号 / 公众号文章 / 直链 / 本地文件）。
 
     这是单条模式的完整逻辑，也被批量模式逐条复用。
@@ -743,7 +906,7 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
             "source": source, "ok": ok,
             "source_type": "article" if is_article else "video",
             "video_type": "", "title": "", "run_dir": None, "final_md": None,
-            "pending": None, "notes": [], "elapsed_sec": 0,
+            "pending": None, "agent_input": None, "notes": [], "elapsed_sec": 0,
             "cost_cny": 0.0, "error": None,
         }
         base["elapsed_sec"] = round(time.time() - started, 1)
@@ -795,10 +958,37 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
         progress.update("init", 2, f"开始处理 {source[:80]}")
         video, is_temp = resolve_source(source, run_dir, progress, wait_manual)
         out = run_stages(video, is_temp, cfg=load_config(), run_dir=run_dir,
-                         progress=progress, keep=keep)
+                         progress=progress, keep=keep,
+                         facts_only=agent_write, source=source,
+                         local_only=local_only)
 
         res = out["result"]
         notes = out["notes"]
+
+        # ---------- Agent 模式：只出干净源，不生成、不发布 Qwen 版 ----------
+        if agent_write:
+            agent_input = Path(notes[0]) if notes else None
+            pending = (write_agent_pending(agent_input.parent, res, out["title"],
+                                           agent_input, source)
+                       if agent_input else None)
+            progress.finish(notes)
+            log("=" * 50)
+            log(f"完成（Agent 模式）！类型={res['video_type']} "
+                f"帧数={res['frames_used']} 成本=¥{res['cost']['cost_cny']} "
+                f"耗时={res['elapsed_sec']}s")
+            for n in notes:
+                log(f"  {n}")
+            if pending:
+                log("-" * 50)
+                log(f"待办清单: {pending}")
+                log("Agent 下一步：读 agent_input.json → 按内容写笔记 → "
+                    "上传 ima「大李老师」→ 回读校验 → 删本地")
+            return _out(True, video_type=res.get("video_type", ""),
+                        title=out.get("title", ""), run_dir=run_dir,
+                        final_md=None, pending=pending, notes=notes,
+                        agent_input=agent_input,
+                        cost_cny=float(res.get("cost", {}).get("cost_cny", 0) or 0))
+
         if not no_publish:
             notes += publish(res, out["title"], notes)
 
@@ -926,7 +1116,8 @@ def write_batch_summary(batch_dir: Path, results: list[dict],
     for i, r in enumerate(results, 1):
         if r.get("ok"):
             mark = "✅"
-            art = Path(r["final_md"]).name if r.get("final_md") else "—"
+            src_art = r.get("final_md") or r.get("agent_input")
+            art = Path(src_art).name if src_art else "—"
             detail = f"`{art}`"
         else:
             mark = "❌"
@@ -991,6 +1182,49 @@ def write_batch_pending(batch_dir: Path, results: list[dict]) -> Path | None:
     return p
 
 
+def write_batch_agent_pending(batch_dir: Path,
+                              results: list[dict]) -> Path | None:
+    """Agent 模式：汇总各条的 agent_input，供 Agent 一次性写笔记 + 上传。"""
+    items = []
+    for i, r in enumerate(results, 1):
+        if not r.get("ok") or not r.get("agent_input"):
+            continue
+        ai = Path(r["agent_input"])
+        if not ai.is_file():
+            continue
+        items.append({
+            "seq": i,
+            "agent_input": str(ai),
+            "title": r.get("title") or "",
+            "video_type": r.get("video_type") or "",
+            "source_url": r.get("source"),
+            "folder_id": AGENT_FOLDER_ID,
+            "notes_dir": str(ai.parent),
+        })
+    if not items:
+        return None
+
+    manifest = {
+        "mode": "agent_write",
+        "batch": True,
+        "count": len(items),
+        "knowledge_base_id": "001a8016b30037f0",
+        "folder_id": AGENT_FOLDER_ID,
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "agent_steps": [
+            "逐条读 agent_input.json 的 facts / transcript / ocr（禁止读任何 *.md）",
+            "按每条内容自定结构写笔记 → 存 outputs/_新版笔记/seqNN_标题.md",
+            "音频文案取自 segments（带 mm:ss），原样保留",
+            f"逐条上传 ima「大李老师」({AGENT_FOLDER_ID}) → 回读校验 → 命中后删本地",
+        ],
+        "items": items,
+    }
+    p = batch_dir / ".agent_pending_batch.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
 def run_batch(sources: list[str], args) -> int:
     """串行批量执行：逐条隔离，失败不中断；支持断点续跑。"""
     OUTPUT.mkdir(parents=True, exist_ok=True)
@@ -1042,7 +1276,10 @@ def run_batch(sources: list[str], args) -> int:
         log("#" * 60)
 
         r = run_one(src, no_publish=args.no_publish, keep=args.keep,
-                    wait_manual=args.wait_manual)
+                    wait_manual=args.wait_manual,
+                    agent_write=getattr(args, "agent_write", False),
+                    local_only=bool(getattr(args, "agent_write", False)
+                                    and not getattr(args, "with_vision", False)))
         results.append(r)
 
         if r["ok"]:
@@ -1056,7 +1293,9 @@ def run_batch(sources: list[str], args) -> int:
 
     # ---------- 收尾：汇总 ----------
     summary = write_batch_summary(batch_dir, results, started_at)
-    pending = write_batch_pending(batch_dir, results)
+    agent_mode = bool(getattr(args, "agent_write", False))
+    pending = (write_batch_agent_pending(batch_dir, results) if agent_mode
+               else write_batch_pending(batch_dir, results))
 
     ok = [r for r in results if r.get("ok")]
     log("")
@@ -1066,11 +1305,15 @@ def run_batch(sources: list[str], args) -> int:
     log(f"批次目录: {batch_dir}")
     log(f"汇总清单: {summary}")
     if pending:
-        log(f"待上传清单: {pending}")
-        log(f"Agent 下一步：读取该清单，逐条上传 ima → 回读校验 → 校验通过后删本地"
-            f"（共 {len(ok)} 项）")
+        log(f"待办清单: {pending}")
+        if agent_mode:
+            log(f"Agent 下一步：读该清单，逐条「读干净源→按内容写笔记→上传 ima→回读校验」"
+                f"（共 {len(ok)} 项）")
+        else:
+            log(f"Agent 下一步：读取该清单，逐条上传 ima → 回读校验 → 校验通过后删本地"
+                f"（共 {len(ok)} 项）")
     else:
-        log("没有成功产出，无待上传清单。")
+        log("没有成功产出，无待办清单。")
     log("=" * 60)
     return 0 if ok else 1
 
@@ -1086,8 +1329,18 @@ def main() -> int:
                     help="断点续跑：指向既有批次目录，跳过已成功项")
     ap.add_argument("--keep", action="store_true", help="保留视频与中间文件")
     ap.add_argument("--no-publish", action="store_true", help="不复制到项目 outputs 目录")
+    ap.add_argument("--agent-write", action="store_true",
+                    help="Agent 写笔记模式：只产出干净源（转录+关键帧+OCR+拼版），"
+                         "不生成、也不发布 Qwen 版笔记；默认同时纯本地（不调 LLM API）")
+    ap.add_argument("--with-vision", action="store_true",
+                    help="配合 --agent-write：保留付费视觉模型（硅基流动），"
+                         "仅在需要无人值守的超大批量时才用；默认纯本地")
     ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
     args = ap.parse_args()
+
+    # Agent 模式默认「纯本地」：不调 LLM API，视觉/写作都交给 Agent；
+    # 只有显式 --with-vision 才保留付费视觉模型（无人值守超大批量场景）。
+    local_only = bool(args.agent_write and not args.with_vision)
 
     sources = load_sources(args)
 
@@ -1103,10 +1356,16 @@ def main() -> int:
     # 单条模式：保持原有输出格式与退出码
     if len(sources) == 1:
         r = run_one(sources[0], no_publish=args.no_publish, keep=args.keep,
-                    wait_manual=args.wait_manual)
+                    wait_manual=args.wait_manual, agent_write=args.agent_write,
+                    local_only=local_only)
         if r["ok"]:
             log("-" * 50)
-            log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
+            if args.agent_write:
+                log(f"模式：Agent 写笔记｜{'纯本地（零 API 调用）' if local_only else '含付费视觉模型'}")
+                log("Agent 下一步：看 contact_sheet 判断类型 → 按需读原帧 → "
+                    "按内容写笔记 → 上传 ima「大李老师」→ 回读校验 → 删本地")
+            else:
+                log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
             return 0
         return 1
 

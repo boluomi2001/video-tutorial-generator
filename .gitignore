@@ -49,6 +49,7 @@ tools/wx_channel/downloads/
 tools/weixin-favor-kb/downloads/
 tools/weixin-favor-kb/output/
 outputs/
+/output/
 
 # ============================================
 # 个人记忆与身份文件（不随项目分享）
@@ -74,3 +75,14 @@ Thumbs.db
 
 # 发布产物（本地留档，已上传到 GitHub Releases）
 _release_assets/
+
+# ============================================
+# ima 上传助手的本地运行数据（含 COS 临时密钥，严禁入库）
+# ============================================
+tools/weixin-favor-kb/scripts/_ima_up*/*.json
+
+# 改代码前的本地备份目录（回退用，不入库）
+tools/weixin-favor-kb/_backup_*/
+tools/weixin-favor-kb/_dense/
+tools/weixin-favor-kb/_probe/
+tools/weixin-favor-kb/_test_link*.txt

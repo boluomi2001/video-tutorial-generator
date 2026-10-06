@@ -160,7 +160,8 @@ _BRIEF_PROMPT = """把这份教程压缩成速览卡片，300 字以内。
 教程:
 {tutorial}
 
-输出 JSON: {{"one_line": "一句话核心", "bullets": ["要点1", "要点2", "要点3"], "who": "适合谁看"}}"""
+严格要求：只输出一个 JSON 对象，不要任何解释文字、不要 markdown 代码块、不要前后缀。
+JSON 格式: {{"one_line": "一句话核心", "bullets": ["要点1", "要点2", "要点3"], "who": "适合谁看"}}"""
 
 
 _CHECKLIST_PROMPT = """把这份教程转成可执行清单，供读者照着做。
@@ -169,7 +170,8 @@ _CHECKLIST_PROMPT = """把这份教程转成可执行清单，供读者照着做
 教程:
 {tutorial}
 
-输出 JSON: {{"items": [{{"step": "步骤描述", "command": "涉及的命令，没有则留空", "done": false}}]}}"""
+严格要求：只输出一个 JSON 对象，不要任何解释文字、不要 markdown 代码块、不要前后缀。
+JSON 格式: {{"items": [{{"step": "步骤描述", "command": "涉及的命令，没有则留空", "done": false}}]}}"""
 
 
 # ---------------------------------------------------------------- helpers
@@ -418,8 +420,14 @@ class ContentAnalyzer:
         title: str = "",
         duration: float = 0.0,
         output_dir: str = "",
+        facts_only: bool = False,
     ) -> dict:
-        """完整分析流程，返回教程 / 速览 / 清单 / 事实 / 成本。"""
+        """完整分析流程，返回教程 / 速览 / 清单 / 事实 / 成本。
+
+        facts_only=True 时，抽完事实就返回——跳过教程/速览/清单/自检，
+        供「Agent 写笔记」模式使用：流水线只负责产出干净的源（事实+转录），
+        不再生成 Qwen 版笔记（既省钱提速，也避免把注水产物混进 Agent 输入）。
+        """
         t0 = time.time()
         transcript = (transcript or "").strip()
         if len(transcript) > CONTEXT_CHAR_BUDGET:
@@ -446,6 +454,29 @@ class ContentAnalyzer:
                  "summary": "", "details": c.get("transcript", "")[:500]}
                 for i, c in enumerate(chapters, 1)
             ]
+
+        # 4.5 Agent 模式：只出事实，到此为止
+        if facts_only:
+            result = {
+                "title": title,
+                "video_type": vtype,
+                "domain": domain,
+                "duration": round(duration, 1),
+                "chapters": facts.get("chapters", []),
+                "facts": facts,
+                "tutorial": "",
+                "brief": {},
+                "checklist": {},
+                "quality": {},
+                "frames_used": len(frames),
+                "cost": self.usage.to_dict(),
+                "elapsed_sec": round(time.time() - t0, 1),
+                "facts_only": True,
+            }
+            if output_dir:
+                self._save_cost(output_dir, result)
+            logger.info("facts_only 模式：已跳过教程/速览/清单生成")
+            return result
 
         # 5. 逐章写教程
         tutorial = self._write_tutorial(vtype, title, facts, duration)
@@ -739,7 +770,7 @@ class ContentAnalyzer:
         try:
             data = self._chat_json(
                 [{"role": "user", "content": _BRIEF_PROMPT.format(tutorial=tutorial[:12000])}],
-                max_tokens=512, tag="brief", heavy=False,
+                max_tokens=512, tag="brief", heavy=True,
             )
         except Exception as e:
             logger.warning("速览生成失败: {}", str(e)[:100])
@@ -751,7 +782,7 @@ class ContentAnalyzer:
             data = self._chat_json(
                 [{"role": "user", "content": _CHECKLIST_PROMPT.format(
                     vtype=vtype, tutorial=tutorial[:12000])}],
-                max_tokens=2048, tag="checklist", heavy=False,
+                max_tokens=2048, tag="checklist", heavy=True,
             )
         except Exception as e:
             logger.warning("清单生成失败: {}", str(e)[:100])

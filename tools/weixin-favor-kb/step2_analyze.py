@@ -122,7 +122,6 @@ try:
     frames_path.mkdir(parents=True, exist_ok=True)
     frame_paths = extract_keyframes(
         str(video), str(frames_path),
-        threshold=config["frames"]["threshold"],
         max_frames=config["frames"]["max_frames"],
     )
     log(f"Keyframes: {len(frame_paths)}")

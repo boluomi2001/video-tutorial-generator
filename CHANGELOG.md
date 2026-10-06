@@ -1,5 +1,60 @@
 # 更新日志
 
+## v0.4.0 —— 2026-10-06
+
+**Agent 写笔记模式：默认纯本地、零 API 成本**
+
+### 新增
+
+- **`--agent-write` 模式（新的默认工作流）**：流水线只产出**干净素材**，
+  视觉理解与写笔记全部交给 Agent
+  - 产出 `notes/agent_input.json`：转录 + `facts` + 画面 OCR（带时间戳）+
+    关键帧路径 + **缩略图拼版** + `frame_profile` + `ocr_stats` + `agent_rules`
+  - **默认纯本地**：连 `ContentAnalyzer` 都不构造 → **跳过分类 / 视觉理解 / 事实抽取
+    三个 LLM 调用**，成本 **¥0**（实测）
+  - 新增 `--with-vision`：需无人值守超大批量时，一键保留付费视觉模型
+  - 新增启动器 `run_agent.cmd`
+- **缩略图拼版 `build_contact_sheet()`**：把全部关键帧拼成一张网格图（每格标时间戳），
+  Agent **读 1 张图即可纵览全片画面**（实测 17 帧 → 1680×474 / 98KB）
+- **自适应信号**：`frame_profile`（画面类型）+ `ocr_stats`（每帧字数）+
+  `agent_rules.adapt_rule`（文稿类走 OCR、视觉类按需读原帧、口播类只写转录）
+- **待办清单**：`notes/.agent_pending.json`、批量 `.agent_pending_batch.json`
+- **ima 上传助手** `scripts/_ima_up2/up_one.py`（单文件 COS 上传）
+
+### 改进
+
+- `run_stages(..., facts_only=, local_only=)`：支持「只出事实」/「纯本地」两种裁剪
+- `run_full(..., facts_only=True)`：抽完事实即返回（跳过教程/速览/清单/自检）
+- **Agent 模式保留 `frames/`**（便于回溯画面来源，也让 Agent 可按需看图）
+- Agent 模式**不再发布 Qwen 版**到 `outputs/`，也不再写 `cost.json`
+- `write_batch_summary()` 在 Agent 模式下展示 `agent_input` 产物名
+
+### 修复
+
+- **`step2_analyze.py` 崩溃**：调用 `extract_keyframes(threshold=…)`，
+  但该函数**没有 `threshold` 形参** → 必然 `TypeError`（两步工作流是坏的）。
+  已删除该参数（其余调用签名均已核实匹配）
+- **`.gitignore` 安全漏洞**：`scripts/_ima_up*/**.json` 含 COS 临时密钥却未被忽略
+  （164 个文件）→ 已补；同时补 `_backup_*/`、根 `output/`
+
+### 文档
+
+- `SKILL.md` **全面重写**（497 → 618 行）：新增 Agent 写笔记 SOP、两种模式对比、
+  `agent_input.json` 结构与取数硬约束、缩略图拼版、「规则之外由 Agent 现场适配」、
+  开发维护（三副本同步 / 备份 / 修复记录 / 发版 SOP）
+- `references/pipeline-commands.md`：补 `--agent-write` / `--with-vision` / 上传脚本
+- `references/tutorial-templates.md`：改为「按内容定结构」指南 + 反面教材（旧模板仅供传统模式）
+
+### 实测数据
+
+| 项目 | 结果 |
+|---|---|
+| 纯本地成本 | **¥0**（vs 传统模式 ¥0.04–0.11/条） |
+| 2 分钟视频全流程 | 约 3 分钟（转录占大头） |
+| 同题新旧对比 | 旧 7,074 字（把"自适应组件"听写成"自摄用组件"）→ 新 6,652 字（用词正确，且多出 12 套主题表、控制台维度、GitHub 真实地址） |
+
+---
+
 ## v0.3.2 —— 2026-10-04
 
 **批量处理：一次给多条链接 + 断点续跑**

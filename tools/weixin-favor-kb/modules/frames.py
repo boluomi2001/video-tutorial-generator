@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import math
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -432,3 +433,59 @@ def _write_meta(out_dir: Path, meta: list[dict], duration: float, budget: int, p
         )
     except Exception as e:
         logger.warning("写入 frames_meta.json 失败: {}", e)
+
+
+def build_contact_sheet(
+    frame_paths: list[str],
+    out_path: str | Path,
+    cols: int = 6,
+    tile_w: int = 280,
+) -> str | None:
+    """把关键帧拼成一张缩略图网格（contact sheet），供 Agent 一次纵览全片画面。
+
+    每格左上角标注该帧时间戳。相比逐帧读图，一张拼版能把上下文开销压到最低；
+    Agent 若需看清某屏细节，再按需读 frames/ 里的单帧原图。
+    """
+    tiles: list[tuple[str, np.ndarray]] = []
+    for p in frame_paths:
+        img = _imread_any(Path(p))
+        if img is None or img.size == 0:
+            continue
+        h, w = img.shape[:2]
+        tw = tile_w
+        th = max(1, int(round(h * tw / float(w))))
+        img = cv2.resize(img, (tw, th), interpolation=cv2.INTER_AREA)
+        tiles.append((Path(p).name, img))
+
+    if not tiles:
+        logger.warning("缩略图拼版：无可用帧")
+        return None
+
+    tile_h = max(t[1].shape[0] for t in tiles)
+    n = len(tiles)
+    rows = math.ceil(n / cols)
+    label_h = 24
+    sheet = np.full((rows * tile_h, cols * tile_w, 3), 245, np.uint8)
+
+    for i, (name, img) in enumerate(tiles):
+        r, c = divmod(i, cols)
+        y, x = r * tile_h, c * tile_w
+        sheet[y:y + img.shape[0], x:x + img.shape[1]] = img
+        m = re.search(r"_t([\d.]+)s", name)
+        ts = float(m.group(1)) if m else 0.0
+        label = f"{int(ts) // 60:02d}:{int(ts) % 60:02d}"
+        cv2.rectangle(sheet, (x, y), (x + 70, y + label_h), (0, 0, 0), -1)
+        cv2.putText(sheet, label, (x + 6, y + 17),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+        cv2.rectangle(sheet, (x, y), (x + tile_w - 1, y + tile_h - 1),
+                      (190, 190, 190), 1)
+
+    out = Path(out_path)
+    ok, buf = cv2.imencode(".jpg", sheet, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not ok:
+        logger.warning("缩略图拼版编码失败")
+        return None
+    out.write_bytes(buf.tobytes())
+    logger.info("缩略图拼版完成: {} 帧 → {} ({}x{})",
+                n, out.name, sheet.shape[1], sheet.shape[0])
+    return str(out)
