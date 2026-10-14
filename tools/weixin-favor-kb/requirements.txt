@@ -12,3 +12,6 @@ cos-python-sdk-v5>=1.9.0
 # 小红书扫码登录（scripts/login_xhs.py 用；复用系统 Edge/Chrome，不额外下载浏览器）
 # 不需要扫码功能的话可以不装，脚本会自动降级成「粘贴 Cookie」模式
 playwright>=1.40
+
+# 生成「本机自生成 CA」（scripts/make_ca.py，替换下载器自带的旧根证书）
+cryptography>=42.0
