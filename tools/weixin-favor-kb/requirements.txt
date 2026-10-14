@@ -8,3 +8,7 @@ numpy>=1.26.0
 loguru>=0.7.0
 rich>=13.0.0
 cos-python-sdk-v5>=1.9.0
+
+# 小红书扫码登录（scripts/login_xhs.py 用；复用系统 Edge/Chrome，不额外下载浏览器）
+# 不需要扫码功能的话可以不装，脚本会自动降级成「粘贴 Cookie」模式
+playwright>=1.40

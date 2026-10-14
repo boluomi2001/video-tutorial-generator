@@ -21,7 +21,35 @@ import urllib.request
 from pathlib import Path
 
 IMA_MCP_URL = os.environ.get("IMA_MCP_URL", "").rstrip("/")
-IMA_KB_ID = os.environ.get("IMA_KB_ID", "001a8016b30037f0")
+# ima 知识库 ID 属于**使用者个人**信息，不硬编码。
+# 取值优先级：环境变量 IMA_KB_ID > config.yaml 的 ima.knowledge_base_id > 空。
+IMA_KB_ID = os.environ.get("IMA_KB_ID", "")
+
+
+def _kb_from_config() -> str:
+    """没给 kb_id 时，尝试从 config.yaml 的 ima 段读。"""
+    try:
+        import yaml
+        cfg = yaml.safe_load((Path(__file__).resolve().parents[1]
+                              / "config.yaml").read_text(encoding="utf-8")) or {}
+        return str((cfg.get("ima") or {}).get("knowledge_base_id") or "").strip()
+    except Exception:
+        return ""
+
+
+_KB_CACHE = IMA_KB_ID
+
+
+def default_kb_id() -> str:
+    """当前生效的知识库 ID（可能为空 = 未配置）。"""
+    global _KB_CACHE
+    if not _KB_CACHE:
+        _KB_CACHE = _kb_from_config()
+    return _KB_CACHE
+
+
+class ImaNotConfigured(RuntimeError):
+    """未配置 ima 知识库 —— 明确报错，不要静默跳过或猜一个 ID。"""
 
 # ima MIME 对照表（取自 MCP schema，拒绝猜测）
 MIME_MAP = {
@@ -120,13 +148,29 @@ def available() -> bool:
     return bool(IMA_MCP_URL)
 
 
-def upload_md(local_path: Path, kb_id: str = IMA_KB_ID,
+def resolve_kb_id(kb_id: str = "") -> str:
+    """确定知识库 ID；没有就明确报错（不猜、不静默）。"""
+    kid = (kb_id or default_kb_id() or "").strip()
+    if not kid:
+        raise ImaNotConfigured(
+            "未配置 ima 知识库 ID。请二选一：\n"
+            "  · config.yaml 增加：\n"
+            "      ima://n"
+            "        knowledge_base_id: \"<你的知识库ID>\"\n"
+            "  · 或设置环境变量 IMA_KB_ID=<你的知识库ID>\n"
+            "知识库 ID 在 ima 客户端的知识库链接里；不打算用 ima 的话，"
+            "把待上传清单当普通文件看即可，不影响出笔记。")
+    return kid
+
+
+def upload_md(local_path: Path, kb_id: str = "",
               folder_id: str = "", mcp_url: str = "") -> dict:
     """把本地 md 上传到 ima，返回 {media_id, title, kb_id}。
 
     失败抛 ImaError。注意：本函数返回成功仅代表 MCP 三步都返回了 200，
     真正的「已入库」必须再用 verify_uploaded() 回读确认。
     """
+    kb_id = resolve_kb_id(kb_id)
     local_path = Path(local_path)
     if not local_path.exists():
         raise ImaError(f"文件不存在: {local_path}")
@@ -192,7 +236,7 @@ def _put_cos(local_path: Path, cred: dict, ctype: str) -> None:
         raise ImaError("COS 上传未返回 ETag")
 
 
-def verify_uploaded(title: str, kb_id: str = IMA_KB_ID,
+def verify_uploaded(title: str, kb_id: str = "",
                     expect_media_id: str = "", mcp_url: str = "",
                     retries: int = 5, interval: float = 3.0) -> dict | None:
     """回读校验：确认 title 真的在 ima 知识库里。
@@ -200,6 +244,7 @@ def verify_uploaded(title: str, kb_id: str = IMA_KB_ID,
     返回命中的 knowledge 字典，未命中返回 None。
     命中判定：标题完全一致，或 media_id 一致。
     """
+    kb_id = resolve_kb_id(kb_id)
     url = mcp_url or IMA_MCP_URL
     if not url:
         return None

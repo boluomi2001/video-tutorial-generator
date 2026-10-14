@@ -1,5 +1,211 @@
 # 更新日志
 
+## v0.5.2 —— 2026-10-15
+
+**重要更正：小红书不需要登录、不需要 Cookie（零配置）**
+
+用户凭直觉提出质疑后实测推翻了我上一版的结论：
+
+| 请求 | 结果 |
+|---|---|
+| App 分享链接（带 `xsec_token`）+ **无 Cookie** | ✅ 拿到图文详情 |
+| App 分享链接 + 完整 Cookie | ✅ 拿到详情 |
+| 裸链接 `/explore/<id>`（不带 token）+ 无 Cookie | ❌ 拿不到 |
+
+**真正的前提是「链接带 `xsec_token`」，与登录无关。**
+
+### 更正
+
+- `modules/xhs_note.py`
+  - `fetch()` 默认**匿名请求**；错误提示改为按「是否缺 xsec_token」分流，
+    不再误导用户去配 Cookie
+  - `XhsNeedCookie` → 更名 **`XhsUnavailable`**（保留旧名别名）；模块 docstring 重写
+  - 新增 `has_xsec_token(url)`；无 Cookie 路径改用**进程级访客 jar**，
+    自动带上服务端下发的 `abRequestId`/`acw_tc`（更像正常浏览器，减少风控）
+- `auto_run.py::xhs_prepare()` 降级链改为 **匿名 → 配置的 Cookie → 下载器 MCP**；
+  `XHS_COOKIE_HINT` 重写为「先查 xsec_token」
+- `scripts/login_xhs.py` 降级为**可选工具**（docstring 与提示语全部改写）
+- 配置模板/`config.yaml`：`xhs.cookie` 默认留空；注释改为「一般不用配」；
+  **用户的实值 Cookie 已从 config.yaml 清除**（不再需要，且早前被测扫码脚本误覆盖过）
+
+### 文档
+
+- README：平台表小红书改「✅ 零配置」；§2.3 注意事项与 §3.6 章节重写为
+  「零配置 + 三类失败原因排查表 + 什么时候才真的需要登录」
+- SKILL §14.1 重写为「前置条件：零配置」，并显式记录**早前错误结论**与真实原因；
+  §14.4 表格中「带 Cookie 时唯一可靠」改为「移动端 UA 首选（匿名即可）」；
+  §15.4 补认知更正条目
+- `config.example.yaml` 小红书段落重写
+
+### 早前错误结论复盘
+
+把「下载器适配器解析失败」+「裸链接失败」两个现象归因成了「笔记详情需登录态」，
+据此写成"硬约束：必须配 Cookie"并让用户 F12 复制。真实原因有两个：
+1. 当时的解析器**只认桌面形态** `note.noteDetailMap`；补上移动端
+   `noteData.data.noteData` 支持后，匿名就通了 —— 补完我没有回归测「无 Cookie」路径；
+2. 失败的那两条链接本来就不带 `xsec_token`。
+
+**教训：改动解析逻辑后，必须把「无凭据路径」也回归一遍。**
+
+---
+
+## v0.5.1 —— 2026-10-14
+
+**安装体验：给 Agent 一键配好，Key 可选、Cookie 扫码**
+
+### 新增
+
+- **根证书加固 `scripts/make_ca.py`**：用「本机自生成 CA」替换下载器内置的
+  SunnyNet 旧证书（**硬编码私钥**，下载器自己都在警告有安全风险；
+  对外分发时等于给别人装了个"公开私钥的根证书"）
+  - 生成 RSA2048/SHA-256/10 年的本机 CA → `<下载器目录>/certs/`
+  - 导入「当前用户」受信任根（**不需要管理员**），并写入 `cert.file/key/name`
+  - 校验：经代理 `127.0.0.1:2023` 访问 HTTPS，**把我们的 CA 当唯一信任根**，
+    能通即证明链路已换成我们的证书
+  - `--status` / `--rollback` / `--remove-legacy`（清理旧 SunnyNet）
+  - ⚠️ 实测：PowerShell `Import-Certificate` 在非交互模式会报「此操作不支持使用 UI」
+    而失败 → 已做成「先 PS、失败自动转 `certutil`」双路
+  - ⚠️ 机器存储里的 SunnyNet 需要**管理员**删除：
+    `certutil -delstore Root SunnyNet`（用户存储部分脚本已自动清掉）
+- **小红书扫码登录 `login_xhs.cmd` / `scripts/login_xhs.py`**
+  - 用系统自带 Edge（`channel=msedge`，**不额外下载 Chromium**）弹出登录页二维码，
+    用户手机扫一次 → 自动检测登录完成 → 写入 `config.yaml` 的 `xhs.cookie`
+  - 扫码不可用（无浏览器/无 GUI/超时）时**自动降级为粘贴模式**并给出 F12 指引
+  - `--validate-only` 只校验；`--check-url <笔记链接>` 做**功能校验**（真实解析一次）
+  - 写配置用「定位 `xhs:` 段只改 cookie 行」的方式，**保留全部注释**（不 load/dump yaml）
+- **`scripts/setup.py` 自动注册 MCP**：合并写入 `~/.workbuddy/mcp.json`
+  （以及 Claude Desktop 配置），**先备份 `.bak`、保留其它 server 与顶层键**、幂等；
+  `--no-mcp` 只打印片段，`--mcp-config <路径>` 指定位置
+- **`scripts/setup.py --login-xhs`**：安装完直接串上扫码登录，一步到位
+
+### 改进
+
+- **LLM API Key 不再是必填**：默认「Agent 写笔记」模式纯本地、零 API 调用，
+  安装时不再要求 Key（只有 `--with-vision` 传统模式才需要）。README 工具表同步改为「可选」
+- **Whisper 模型下载默认走镜像**：`auto_run.py` 启动时 `HF_ENDPOINT=hf-mirror.com`
+  （已显式设置则尊重用户设置），解决国内首次下载 medium（1.5GB）过慢
+- `setup.py` 收尾提示重写：把视频号两条通道讲清楚
+  （① 推荐：CF Worker，需注册；② 零注册：微信兜底），并说明其它平台无需 Cookie
+- README §3.6 小红书段落重写：扫码优先、粘贴兜底、如何验证；
+  §5.1 说明 MCP 已自动注册 + 必须重启 Agent 并点「信任」
+
+### 实测记录（重要，勿踩回去）
+
+| 发现 | 结论 |
+|---|---|
+| **未登录也会下发 `web_session`**（38 位、同样 `030037ad` 开头） | ❌ 不能用它判定登录成功 → 扫码脚本改用「登录弹窗已消失」 |
+| **headless 浏览器触发风控** | 页面变「安全限制 IP存在风险 300012」→ 扫码必须 `headless=False` |
+| 有头模式下 `/login` 正常渲染二维码（2 个 canvas + 「扫码」文案） | ✅ 作为扫码目标页 |
+| 注入 Cookie 无法恢复网页登录态（仍显示登录弹窗） | 网页 UI 不能作为功能校验口径 → 用 `--check-url` 真实解析 |
+
+### 证书加固实测结果（2026-10-14）
+
+| 项 | 结果 |
+|---|---|
+| 生成 CA | ✅ CN=`WX Video Download Local CA`，指纹 `02835fe5…`，2026-10-14 → 2036-10-11 |
+| 导入当前用户根存储 | ✅ `certutil -user -store Root` 回读确认 |
+| 下载器生效证书 | ✅ `get_certificate_status` → `source=generated`，**风险警告已消失**（原为 `sunny_net` + 硬编码密钥警告） |
+| 代理链路校验 | ✅ 经 `127.0.0.1:2023` 访问 baidu/bing 均 200，证书链 = 我们的 CA |
+| 删除旧 SunnyNet（用户存储） | ✅ 已删；代理链路复查仍通过（证明不再依赖旧证书） |
+| 删除旧 SunnyNet（机器存储） | ⏳ 需管理员：`certutil -delstore Root SunnyNet` |
+
+### 待办（需用户配合，未做）
+
+- 下载器机器存储里的 SunnyNet 需**管理员**删除：`certutil -delstore Root SunnyNet`
+- 视频号本地（微信）通道的**完整跑批**未跑（下载与路由已实测，见下）
+
+### 视频号微信兜底通道实测（2026-10-14，**通过**）
+
+用户在微信里打开视频号任意视频页后：
+
+| 项 | 结果 |
+|---|---|
+| `wxchannels:page` | ✅ `available=True`（原为「等待视频号页面连接」） |
+| `wxchannels:sph` | ✅ `available=True`（下载器从微信流量里顺带抓到了 yuanbao Cookie） |
+| `fetch_content`（视频号链接） | ✅ platform=wxchannels，拿到标题/类型 |
+| 实际下载 18 分钟视频 | ✅ **9 秒**完成（1080p / 155MB） |
+| 流水线路由降级 | ✅ 禁用 Worker 后自动落到 MCP 本地通道，**1 秒复用**已下载产物 |
+
+**结论：零注册也能抓视频号** —— 代价是「下载器常驻 + 微信停在视频号页面」，且仅 Windows。
+新增 `--no-worker` / `SPH_NO_WORKER=1` 供强制走这条通道。
+
+### 本期修掉的坑（视频号本地通道）
+
+| 现象 | 原因 | 修复 |
+|---|---|---|
+| 重跑同一条视频号链接**卡满 2 分钟被掐断** | `download_wxchannels_video` 的 `existing_action` 默认 `error`，而我们封装时没传；冲突后客户端一直等 | 封装默认传 `existing_action="overwrite"` |
+| 视频号任务**无法复用已有产物** | 这类任务的 `source_url` 常是空串，按 URL 匹配永远不中 | 新增 `content_id_of()` 先解析出 `wxchannels:<id>`，`find_finished_task(content_id=…)` 据此命中（实测 1 秒复用） |
+| 客户端超时比服务端短 | `MCPClient` 固定 120s，大文件下载会被自己掐断 | `call()/_rpc()` 支持超时参数，下载类放到 960s |
+| 视频号本地通道**没写标题旁路** | 只有 Worker 通道写了 `.title.txt` | 本地通道也用 `fetch_content` 的标题/作者写旁路 |
+
+---
+
+## v0.5.0 —— 2026-10-14
+
+**多平台渠道扩展：新增 B站 / 小红书 / 抖音等平台，支持小红书图文笔记**
+
+### 新增
+
+- **平台识别与路由层 `modules/platforms.py`**
+  - 20+ 域名规则 → 平台 key（bilibili / xiaohongshu / douyin / kuaishou /
+    weibo / zhihu / youtube / x / instagram / cctv），与下载器
+    `get_platform_status` 的 key 对齐
+  - 短链展开（xhslink / v.douyin / b23.tv …）；小红书必须用移动端 UA 展开，
+    桌面 UA 会被 302 到登录页并丢掉目标路径
+  - 标题清洗 + `<媒体文件>.title.txt` 旁路约定（与视频号通道一致），
+    解决 B站/抖音产出文件名叫整段描述导致 md 命名不可读的问题
+  - 落盘产物检测：从「只认 `*.mp4`」扩展为视频/图片/文本三类多扩展名扫描 +
+    图集「写满静止 N 秒」判定 + 复用已下载产物
+- **小红书通道 `modules/xhs_note.py`**（与 `wx_article.py` 同级的独立通道）
+  - 支持**图文笔记**（默认）与**视频笔记**（转交视频流水线）
+  - 解析 `window.__INITIAL_STATE__` → `note.noteDetailMap`，取标题/正文/
+    作者/发布时间/话题标签/原图列表/视频直链
+  - 图集下载 + **保真归档 md**（原文不改写，配图本地化，离线可读）
+  - 无登录态时抛 `XhsNeedCookie`（专门异常，带可操作提示），不静默产出空笔记
+- **归档目录**：`outputs/小红书笔记/`（md + `images/` 同目录）
+- **`--publish-by-platform`**：发布时在类型目录下再按平台分子目录
+  （如 `outputs/公众号视频项目/功能提升教学/B站/`），默认关闭以保持历史路径不变
+
+### 改进
+
+- `resolve_source()` 返回结构化产物字典 `{video, images, title, is_temp}`，
+  不再只认单个视频路径；**通用图集兜底**：非小红书平台若下载器只吐图片，
+  也走归档而不是报错
+- `_mcp_try_download()` 失败快速失败：
+  - 解析层失败即短路（下载依赖解析出的直链），小红书不再白等 900s 超时
+  - 解析失败时下载超时降到 120s
+- `MCPClient.download_content()` 默认 `existing_action="overwrite"`：
+  下载器默认遇「已存在该下载内容」返回冲突错误，而 `wait_for_completion`
+  会一直等到超时（实测卡满 900s）；重跑同一条链接是常态操作
+- `MCPClient.find_finished_task()`：重跑同一条链接时先查已完成任务，
+  文件仍在磁盘上就直接复用（实测 2.1s vs 重新下载）
+- `agent_input.json` 新增 `platform` / `platform_label`，Agent 可知来源平台
+- run 目录命名带平台：`<时间戳>_bilibili_video` / `_douyin_video` / `_xhs_note`
+
+### 已知限制
+
+- **小红书需要一次性配置 Cookie**：网页端对笔记详情做了登录态校验，
+  无 Cookie 时页面数据里只有 feed、没有笔记详情，
+  因此任何纯匿名解析（含第三方下载器的小红书适配器）都会失败。
+  配置方式见 README §3.6（`xhs.cookie` 或环境变量 `XHS_COOKIE`）
+- ⚠️ **同一笔记有两种页面形态**：实测带 Cookie 时**只有移动端页面**内联了笔记详情
+  （`noteData.data.noteData`），桌面端 `__INITIAL_STATE__` 仍只有 feed。
+  解析器已两种都认（移动端优先），UA 顺序**不要**改回桌面优先
+- 视频号 `wxchannels:sph` 本地通道仍缺 `yuanbao.tencent.com` Cookie；
+  现有云端 Worker 通道不受影响
+
+### 测试
+
+| 链接 | 结果 |
+|---|---|
+| 抖音 `v.douyin.com/q-37jo2pDZc` | ✅ 解析 + 下载 + 转录 + 抽帧 + OCR + 干净源（30 帧 / 1390 字） |
+| B站 `bilibili.com/video/BV1nK4y1M73T` | ✅ 解析 + 下载 + 转录 + 抽帧 + OCR + 干净源（22 帧 / 958 字） |
+| 小红书 `xhslink.cn/o/7yskqwB6yDB`（**视频笔记**） | ✅ 解析 + 下载 + 转视频通道（23 帧 / 1196 字） |
+| 小红书 **图文笔记**（`xhslink.cn/o/6WVwhOhlzS1`） | ✅ 端到端：解析 + 3 张原图本地化 + 保真 md → `outputs/小红书笔记/` |
+| 小红书无 Cookie | ✅ 按预期快速失败并给出配置指引（不再白等超时） |
+
+---
+
 ## v0.4.0 —— 2026-10-06
 
 **Agent 写笔记模式：默认纯本地、零 API 成本**

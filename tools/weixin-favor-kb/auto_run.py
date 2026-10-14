@@ -2,7 +2,7 @@
 
 用法:
     # 单条
-    python auto_run.py "<视频号链接 / 公众号文章链接 / 本地文件路径>" [选项]
+    python auto_run.py "<链接 / 本地文件路径>" [选项]
 
     # 批量（多条位置参数）
     python auto_run.py "<链接1>" "<链接2>" "<链接3>" ...
@@ -16,11 +16,21 @@
 选项:
     --keep            保留视频与中间文件
     --no-publish      不复制到项目 outputs 目录
+    --publish-by-platform  发布时在类型目录下再按平台分子目录
+    --no-worker       禁用云端解析 Worker，视频号强制走本地/微信通道
     --wait-manual N   等待手动下载的分钟数（默认 30）
 
-流程:
-    视频号/文件 → 下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
-    公众号文章  → 抓取 → 保真转 Markdown（原文归档，不改写）→ 清理
+支持的输入（按链接自动分流）:
+    微信视频号     → 云端 Worker 解析（免登录）→ 视频流水线
+    B站 / 抖音 / 快手 / 微博 / YouTube …  → 下载器 MCP → 视频流水线
+    小红书         → 图文笔记归档（需 Cookie）/ 视频笔记转视频流水线
+    公众号文章     → 抓取 → 保真转 Markdown（原文归档，不改写）
+    本地文件       → 直接进视频流水线
+
+流程（视频通道）:
+    下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
+流程（小红书图文通道）:
+    解析笔记 → 下载原图 → 保真归档 md（不改写）→ 清理
 
 批量模式:
     串行逐条执行，单条失败不中断后续；每条独立 run 目录（沿用 output/）。
@@ -45,6 +55,10 @@ from pathlib import Path
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 os.environ.setdefault("PYTHONLEGACYWINDOWSSTDIO", "utf-8")
+# Whisper 模型首次使用要从 HuggingFace 下载（medium 约 1.5GB），国内直连很慢。
+# 默认切到镜像；想用官方源就显式设 HF_ENDPOINT=https://huggingface.co
+# （必须在 import faster_whisper / huggingface_hub 之前设好——所以放在这里）
+os.environ.setdefault("HF_ENDPOINT", "https://hf-mirror.com")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 try:
@@ -56,7 +70,7 @@ except Exception:
 import yaml
 from loguru import logger
 
-from modules import wx_article, wx_download
+from modules import platforms, wx_article, wx_download, xhs_note
 from modules.analyzer import VIDEO_TYPE_PROJECT, ContentAnalyzer
 from modules.audio import extract_audio
 from modules.frames import build_contact_sheet, extract_keyframes, resolve_ffmpeg
@@ -68,6 +82,8 @@ DOWNLOADS = ROOT / "downloads"
 OUTPUT = ROOT / "output"
 PROJECT_ROOT = ROOT.parent.parent
 PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "公众号视频项目"
+# 小红书图文/视频笔记的归档目录（原文归档，不改写）
+XHS_PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "小红书笔记"
 # 公众号文章归档的 ima 目标文件夹（知识分享类 → 功能提升教学）
 ARTICLE_FOLDER_HINT = "功能提升教学"
 
@@ -149,6 +165,26 @@ def load_config() -> dict:
     return cfg
 
 
+def _ima_setting(key: str, env_name: str) -> str:
+    """读 ima 相关配置：环境变量 > config.yaml 的 ima 段 > 空。
+
+    知识库 ID / 文件夹 ID 属于**使用者个人**信息，不能硬编码进仓库。
+    留空时上报相关功能会被跳过（不报错），需要的人自己填。
+    """
+    v = (os.environ.get(env_name) or "").strip()
+    if v:
+        return v
+    try:
+        return str((load_config().get("ima") or {}).get(key) or "").strip()
+    except Exception:
+        return ""
+
+
+IMA_KB_ID = _ima_setting("knowledge_base_id", "IMA_KB_ID")
+IMA_FOLDER_ID = _ima_setting("folder_id", "IMA_FOLDER_ID")
+IMA_KB_NAME = "你的 ima 知识库"
+
+
 def _sph_worker_try_download(source: str, progress: Progress) -> Path | None:
     """用已部署的 Cloudflare Worker 云端解析+下载视频号视频。
 
@@ -186,23 +222,22 @@ def resolve_title(video: Path, explicit: str = "") -> str:
     """确定用于命名最终 md 的标题。
 
     优先级：显式传入 > 下载时留下的 <stem>.title.txt > 文件名去扩展名。
-    这样视频号下载不再用 `AWEUh1CSE0` 这种无意义 ID 命名。
+    这样视频号/B站/抖音下载不再用 `AWEUh1CSE0`、`_quality_1080x1920` 这种无意义命名。
     """
     if explicit:
         return explicit
-    sidecar = video.with_suffix(".title.txt")
-    if sidecar.exists():
-        try:
-            t = sidecar.read_text(encoding="utf-8").strip()
-            if t:
-                return t
-        except Exception:
-            pass
+    side = platforms.read_title_sidecar(video)
+    if side:
+        return side
     return video.stem.rsplit("_", 1)[0] if "_" in video.stem else video.stem
 
 
-def _mcp_try_download(source: str, progress: Progress) -> Path | None:
-    """尝试用新版下载器的 MCP 直接下载，成功返回文件路径，失败返回 None。"""
+def _mcp_try_download(source: str, progress: Progress) -> dict | None:
+    """尝试用新版下载器的 MCP 直接下载，返回产物字典，失败返回 None。
+
+    返回值：{"video": Path|None, "images": [Path], "title": str, "platform": str}
+    ——视频号/B站/抖音等视频类产出 video；小红书图集等产出 images。
+    """
     wx_download.ensure_downloader(wait_sec=25)  # 没在跑就静默拉起
     try:
         cli = wx_download.MCPClient()
@@ -210,7 +245,40 @@ def _mcp_try_download(source: str, progress: Progress) -> Path | None:
         progress.update("download", 4, f"MCP 不可用（{str(e)[:60]}），转常规流程")
         return None
 
-    before = {str(p) for p in DOWNLOADS.rglob("*.mp4")} if DOWNLOADS.exists() else set()
+    plat = platforms.detect(source)
+    plat_cn = platforms.label(plat)
+    before = platforms.snapshot(DOWNLOADS)
+    title = ""
+    meta_ok = False
+    dl_timeout = 900
+
+    # 复用已下载产物：重跑同一条链接时下载器会判「已存在该下载内容」，
+    # 这里先查最近一条已完成任务，文件仍在磁盘上就直接接管，省一次完整下载。
+    try:
+        old = cli.find_finished_task(source,
+                                     alt_urls=(platforms.resolve_redirect(source),))
+    except Exception:
+        old = None
+    if old:
+        files = [Path(str(f.get("file_path")))
+                 for f in (old.get("files") or []) if isinstance(f, dict)
+                 and Path(str(f.get("file_path") or "")).exists()]
+        vids = [p for p in files if p.suffix.lower() in platforms.VIDEO_EXTS]
+        imgs = [p for p in files if p.suffix.lower() in platforms.IMAGE_EXTS]
+        if vids or imgs:
+            progress.update("download", 20,
+                            f"复用已下载产物（{len(vids)} 视频 / {len(imgs)} 图）")
+            try:
+                meta = platforms.fetch_profile(source, cli)
+                title = platforms.compose_title(meta.get("author", ""),
+                                                meta.get("title", ""))
+            except Exception:
+                title = ""
+            if title:
+                platforms.write_title_sidecar((vids or imgs)[0], title)
+            return {"video": (max(vids, key=lambda p: p.stat().st_mtime)
+                              if vids else None),
+                    "images": imgs, "title": title, "platform": plat}
 
     try:
         if wx_download.is_sph_url(source):
@@ -219,57 +287,135 @@ def _mcp_try_download(source: str, progress: Progress) -> Path | None:
                     "download", 4,
                     "微信视频号页面未连接，请在微信里打开视频号后重试（随后自动接管）")
                 return None
-            progress.update("download", 5, "MCP 下载视频号视频")
-            res = cli.download_video(source, download_dir=str(DOWNLOADS))
+            # 视频号任务的 source_url 常是空串，只能靠 content_id 命中已下载任务。
+            # fetch_content 对视频号链接实测可用，顺便把标题/作者一起拿回来。
+            cid, ctitle, cauthor = cli.content_id_of(source)
+            title = platforms.compose_title(cauthor, platforms.clean_title(ctitle))
+            if cid:
+                old = None
+                try:
+                    old = cli.find_finished_task(content_id=cid)
+                except Exception:
+                    old = None
+                if old:
+                    files = cli.files_of(old)
+                    vids = [p for p in files
+                            if p.suffix.lower() in platforms.VIDEO_EXTS]
+                    if vids:
+                        newest = max(vids, key=lambda p: p.stat().st_mtime)
+                        if title:
+                            platforms.write_title_sidecar(newest, title)
+                        progress.update("download", 20,
+                                        f"复用已下载视频号产物 {newest.name[:40]}")
+                        return {"video": newest, "images": [], "title": title,
+                                "platform": plat}
+            progress.update("download", 5,
+                            "MCP 下载视频号视频（本地通道）"
+                            + (f"｜{title[:30]}" if title else ""))
+            res = cli.download_video(source, download_dir=str(DOWNLOADS),
+                                     existing_action="overwrite")
         else:
-            progress.update("download", 5, "MCP 解析并下载")
-            res = cli.download_content(source, download_dir=str(DOWNLOADS))
+            # 非视频号：先取元数据（标题/作者/形态），再下载。
+            # B站/抖音/快手/微博等走 download_content；小红书当前多为图集。
+            try:
+                meta = platforms.fetch_profile(source, cli)
+                meta_ok = True
+                title = platforms.compose_title(meta.get("author", ""),
+                                                meta.get("title", ""))
+                if meta.get("kind"):
+                    progress.update(
+                        "download", 5,
+                        f"MCP 解析 {plat_cn}（{meta['kind']}）"
+                        + (f"｜{title[:30]}" if title else ""))
+            except Exception as e:
+                # 解析层就失败 → 下载层必然也失败（下载依赖解析出的直链）。
+                # 这里直接短路，避免 wait_for_completion 白等十几分钟：
+                # 小红书当前就属于这种情况（需登录态，适配器拿不到笔记详情）。
+                progress.update("download", 4,
+                                f"MCP 解析 {plat_cn} 失败：{str(e)[:60]}")
+                if plat == "xiaohongshu":
+                    return None
+                dl_timeout = 120
+            res = cli.download_content(source, download_dir=str(DOWNLOADS),
+                                       timeout=dl_timeout)
     except Exception as e:
-        progress.update("download", 4, f"MCP 下载失败（{str(e)[:60]}），转常规流程")
+        progress.update("download", 4,
+                        f"MCP 下载失败（{str(e)[:60]}），转常规流程")
         return None
 
-    # 等待新文件落盘
-    deadline = time.time() + 600
-    while time.time() < deadline:
-        now = {str(p) for p in DOWNLOADS.rglob("*.mp4")} if DOWNLOADS.exists() else set()
-        new = now - before
-        if new:
-            newest = max(new, key=lambda p: Path(p).stat().st_mtime)
-            if wx_download._wait_stable(Path(newest)):
-                progress.update("download", 20, f"MCP 下载完成 {Path(newest).name[:40]}")
-                return Path(newest)
-        time.sleep(3)
+    # 等待新文件落盘（视频 / 图集两种形态）
+    got = platforms.wait_for_artifacts(DOWNLOADS, before, timeout=600)
+    videos, images = got.get("video") or [], got.get("image") or []
+
+    if videos:
+        newest = max(videos, key=lambda p: p.stat().st_mtime)
+        if not title and not meta_ok:
+            # 解析元数据失败、但下载居然成功（少见）：补取一次标题
+            try:
+                meta = platforms.fetch_profile(source, cli)
+                title = platforms.compose_title(meta.get("author", ""),
+                                                meta.get("title", ""))
+            except Exception:
+                title = ""
+        if title:
+            platforms.write_title_sidecar(newest, title)
+        progress.update("download", 20, f"MCP 下载完成 {newest.name[:40]}")
+        return {"video": newest, "images": [], "title": title, "platform": plat}
+
+    if images:
+        if title:
+            platforms.write_title_sidecar(images[0], title)
+        progress.update("download", 20,
+                        f"MCP 下载完成 {plat_cn} 图集 {len(images)} 张")
+        return {"video": None, "images": images, "title": title, "platform": plat}
 
     progress.update("download", 4, "MCP 已提交但未检测到文件，转常规流程")
     return None
 
 
 def resolve_source(source: str, run_dir: Path, progress: Progress,
-                   wait_manual: int) -> tuple[Path, bool]:
-    """返回 (视频路径, 是否为本次下载的临时文件)。"""
+                   wait_manual: int, prefer_worker: bool = True) -> dict:
+    """下载/定位素材。
+
+    返回：{"video": Path|None, "images": [Path], "title": str, "is_temp": bool}
+    —— 视频类只填 video；图集类只填 images；本地文件 is_temp=False。
+
+    prefer_worker=False（或环境变量 SPH_NO_WORKER=1）时跳过云端 Worker，
+    视频号强制走「下载器 + 微信页面」本地通道 —— 给不想注册 Cloudflare 的人用。
+    """
     p = Path(source)
     if p.exists() and p.is_file():
         progress.update("download", 5, f"使用本地文件 {p.name}")
-        return p, False
+        return {"video": p, "images": [], "title": "", "is_temp": False}
 
     if not source.startswith("http"):
         raise RuntimeError(f"无法识别的输入: {source}")
 
+    plat = platforms.detect(source)
+    plat_cn = platforms.label(plat)
+    if os.environ.get("SPH_NO_WORKER", "").strip() in ("1", "true", "yes"):
+        prefer_worker = False
+
     # ① 视频号链接：优先走云端 Worker 解析（免登录态、免本地进程、全自动）
-    if wx_download.is_sph_url(source):
+    if wx_download.is_sph_url(source) and prefer_worker:
         got = _sph_worker_try_download(source, progress)
         if got is not None:
-            return got, True
+            return {"video": got, "images": [], "title": "", "is_temp": True}
+    elif wx_download.is_sph_url(source):
+        progress.update("download", 4, "已禁用云端 Worker → 走本地/微信通道")
 
     # ② 优先走新版下载器的 MCP（视频号需微信页面已连接，其他平台直接可用）
+    if not plat == "generic" or not wx_download.is_sph_url(source):
+        progress.update("download", 4, f"识别为 {plat_cn}")
     got = _mcp_try_download(source, progress)
     if got is not None:
-        return got, True
+        return {"video": got.get("video"), "images": got.get("images") or [],
+                "title": got.get("title") or "", "is_temp": True}
 
     if not wx_download.is_sph_url(source):
-        progress.update("download", 5, "直链下载中")
+        progress.update("download", 5, "直链兜底下载")
         target = wx_download.fetch_direct(source, DOWNLOADS)
-        return target, True
+        return {"video": target, "images": [], "title": "", "is_temp": True}
 
     # 视频号链接
     progress.update("download", 3, "检查 wx_channel 服务")
@@ -302,13 +448,13 @@ def resolve_source(source: str, run_dir: Path, progress: Progress,
     if got is None:
         raise RuntimeError("等待手动下载超时")
     progress.update("download", 20, f"已获取视频 {got.name}")
-    return got, True
+    return {"video": got, "images": [], "title": "", "is_temp": True}
 
 
 def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
                progress: Progress, keep: bool,
                facts_only: bool = False, source: str = "",
-               local_only: bool = False) -> dict:
+               local_only: bool = False, platform_key: str = "") -> dict:
     transcripts_dir = run_dir / "transcripts"
     frames_dir = run_dir / "frames"
     notes_dir = run_dir / "notes"
@@ -421,7 +567,8 @@ def run_stages(video: Path, is_temp: bool, cfg: dict, run_dir: Path,
         # 不生成 Qwen 版笔记（tutorial/brief/checklist），也不做整合稿。
         progress.update("write", 90, "落地干净源（Agent 模式）")
         written = write_agent_input(notes_dir, run_dir, result_full, title,
-                                    transcript, segments, ocr_items, source)
+                                    transcript, segments, ocr_items, source,
+                                    platform_key=platform_key)
     else:
         progress.update("write", 90, "写入笔记")
         written = write_outputs(notes_dir, result_full, title,
@@ -607,7 +754,7 @@ def write_ima_pending(notes_dir: Path, final_md: Path, res: dict,
     manifest = {
         "final_md": str(final_md),
         "title": final_md.name,
-        "knowledge_base_id": "001a8016b30037f0",
+        "knowledge_base_id": IMA_KB_ID,
         "folder_hint": sub,
         "delete_local_after_verify": True,
         "notes_dir": str(notes_dir),
@@ -627,12 +774,13 @@ def write_ima_pending(notes_dir: Path, final_md: Path, res: dict,
 def write_agent_input(notes_dir: Path, run_dir: Path, res: dict, title: str,
                       transcript: str, segments: list[dict] | None,
                       ocr_items: list[tuple[float, str]] | None,
-                      source: str = "") -> list[str]:
+                      source: str = "", platform_key: str = "") -> list[str]:
     """Agent 模式：只落地「干净源」——转录 + 结构化事实 + 画面文字(OCR)。
 
     刻意**不写** tutorial/brief/checklist，也不做整合稿：Qwen 的注水产物一旦
     混进输入就会把 Agent 带偏。取数约定直接写进本文件，避免口头约定失效。
     """
+    plat = platform_key or platforms.detect(source)
     tdir = run_dir / "transcripts"
     tpath = next(iter(sorted(tdir.glob("*.txt"))), None)
     spath = next(iter(sorted(tdir.glob("*_segments.json"))), None)
@@ -665,6 +813,8 @@ def write_agent_input(notes_dir: Path, run_dir: Path, res: dict, title: str,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "title": title,
         "source_url": source,
+        "platform": plat,
+        "platform_label": platforms.label(plat),
         "video_type": res.get("video_type", ""),
         "domain": res.get("domain", ""),
         "duration": res.get("duration", 0),
@@ -694,7 +844,8 @@ def write_agent_input(notes_dir: Path, run_dir: Path, res: dict, title: str,
             ],
             "note": ("先看 contact_sheet（全片关键帧缩略拼版，每格标了时间戳）纵览画面；"
                      "只在需要看清某屏时才读 frames/ 里的单帧原图。"
-                     "笔记结构按本条视频内容自定；音频文案取自 segments（带 mm:ss），原样保留。"),
+                     "笔记结构按本条视频内容自定；音频文案取自 segments（带 mm:ss），原样保留。"
+                     f"本条来源平台：{platforms.label(plat)}（platform={plat}）。"),
             "adapt_rule": (
                 "按内容自适应。注意：frame_profile / ocr_stats 是本地机器算出的**参考信号**，"
                 "可能失准（例：彩色打光下人脸检测会漏检、字幕多的口播会被判成 code）——"
@@ -717,9 +868,6 @@ def write_agent_input(notes_dir: Path, run_dir: Path, res: dict, title: str,
     return [str(p)]
 
 
-AGENT_FOLDER_ID = "folder_7512859667859656"   # ima「大李老师」（2026-10-06 重建）
-
-
 def write_agent_pending(notes_dir: Path, res: dict, title: str,
                         agent_input: Path, source: str = "") -> Path:
     """Agent 模式的待办清单：不是「待上传 md」，而是「待 Agent 写笔记」。"""
@@ -729,9 +877,9 @@ def write_agent_pending(notes_dir: Path, res: dict, title: str,
         "mode": "agent_write",
         "agent_input": str(agent_input),
         "title": title,
-        "knowledge_base_id": "001a8016b30037f0",
+        "knowledge_base_id": IMA_KB_ID,
         "folder_hint": sub,
-        "folder_id": AGENT_FOLDER_ID,
+        "folder_id": IMA_FOLDER_ID,
         "source_url": source,
         "delete_local_after_verify": True,
         "notes_dir": str(notes_dir),
@@ -741,7 +889,7 @@ def write_agent_pending(notes_dir: Path, res: dict, title: str,
             "按视频内容自定笔记结构（观点 / 操作 / 科普 / 方法 / 工具 / 随笔 …）",
             "音频文案取自 segments（带 mm:ss），原样保留",
             "写出的 md 存到 outputs/_新版笔记/",
-            f"上传 ima「大李老师」({AGENT_FOLDER_ID}) → 回读校验 → 命中后删本地",
+            f"上传 ima「你的知识库」({IMA_FOLDER_ID}) → 回读校验 → 命中后删本地",
         ],
     }
     p = notes_dir / ".agent_pending.json"
@@ -750,7 +898,8 @@ def write_agent_pending(notes_dir: Path, res: dict, title: str,
     return p
 
 
-def publish(res: dict, title: str, notes: list[str]) -> list[str]:
+def publish(res: dict, title: str, notes: list[str],
+            source: str = "", by_platform: bool = False) -> list[str]:
     """把笔记同步到项目 outputs 目录。"""
     if res.get("source_type") == "article":
         # 文章归档：目录单独归类，文件名原样（标题已在文件名里）
@@ -766,8 +915,33 @@ def publish(res: dict, title: str, notes: list[str]) -> list[str]:
             out.append(str(target))
         return out
 
+    if res.get("source_type") == "xhs_note":
+        # 小红书笔记归档：md + 配图同目录，保持相对引用可用
+        dest_dir = XHS_PUBLISH_ROOT
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out: list[str] = []
+        src_md = Path(notes[0])
+        for src in notes:
+            p = Path(src)
+            if p.name == "raw.json":
+                continue
+            shutil.copy2(p, dest_dir / p.name)
+            out.append(str(dest_dir / p.name))
+        # 配图目录整份复制（md 里是 `images/xx.jpg` 相对引用）
+        img_src = src_md.parent / "images"
+        if img_src.is_dir():
+            img_dst = dest_dir / "images"
+            img_dst.mkdir(parents=True, exist_ok=True)
+            for f in img_src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, img_dst / f.name)
+        return out
+
     sub = "项目复刻教学" if res["video_type"] == VIDEO_TYPE_PROJECT else "功能提升教学"
     dest_dir = PUBLISH_ROOT / sub
+    if by_platform:
+        key = res.get("platform") or platforms.detect(source)
+        dest_dir = dest_dir / platforms.label(key or "generic")
     dest_dir.mkdir(parents=True, exist_ok=True)
     safe = sanitize(title, 60)
     out = []
@@ -858,7 +1032,7 @@ def write_article_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
     manifest = {
         "final_md": str(final_md),
         "title": final_md.name,
-        "knowledge_base_id": "001a8016b30037f0",
+        "knowledge_base_id": IMA_KB_ID,
         "folder_hint": ARTICLE_FOLDER_HINT,
         "source_type": "article",
         "source_url": res.get("url", ""),
@@ -875,17 +1049,176 @@ def write_article_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
     return p
 
 
+# ------------------------------------------------------------ 小红书笔记通道
+
+XHS_COOKIE_HINT = (
+    "小红书解析失败。请按顺序排查：\n"
+    "  1) 链接里有没有 xsec_token？**这才是关键**（与登录无关）——\n"
+    "     请在小红书 App 里打开该笔记 →「分享」→「复制链接」，用复制出来的链接重试；\n"
+    "     浏览器地址栏直接复制、或手打的 /explore/<id> 裸链接通常不带 token，匿名拿不到详情。\n"
+    "  2) 笔记是不是已删除 / 被设为私密 / 仅关注可见？这类才需要登录态。\n"
+    "  3) 确实需要登录时，把 Cookie 写进 config.yaml 的 xhs.cookie（或用环境变量 XHS_COOKIE），\n"
+    "     或直接跑 login_xhs.cmd 扫码登录（会帮你自动写入）。"
+)
+
+
+def _norm_xhs_note(raw: dict) -> dict:
+    """把 xhs_note.fetch 的结果规整成通道内部统一结构。"""
+    title = (raw.get("title") or "").strip()
+    desc = (raw.get("desc") or "").strip()
+    if not title:
+        title = platforms.clean_title(desc)
+    return {
+        "kind": raw.get("kind") or "images",
+        "title": title,
+        "desc": desc,
+        "author": (raw.get("author") or "").strip(),
+        "publish_time": raw.get("publish_time") or "",
+        "tags": raw.get("tags") or [],
+        "url": raw.get("url") or "",
+        "note_id": raw.get("note_id") or "",
+        "remote_images": raw.get("images") or [],
+        "video_url": raw.get("video_url") or "",
+    }
+
+
+def xhs_prepare(source: str, progress: Progress) -> tuple[dict, Path | None, list[Path]]:
+    """解析小红书链接，返回 (规范化笔记, 本地视频路径|None, 本地图片列表)。
+
+    优先级（2026-10-15 更正：**匿名优先，不需要登录**）：
+      ① 直接解析（不带 Cookie）—— 只要链接带 xsec_token 就能拿到详情
+      ② 配置里有 `xhs.cookie` → 带 Cookie 再试一次（私密/仅关注可见才需要）
+      ③ 下载器 MCP 兜底
+    全失败时抛出带操作指引的异常，绝不静默产出空笔记。
+    """
+    progress.update("fetch", 10, "解析小红书笔记（匿名）")
+    try:
+        raw = xhs_note.fetch(source)
+        return _norm_xhs_note(raw), None, []
+    except xhs_note.XhsUnavailable as e:
+        log(f"小红书匿名解析失败：{e}")
+
+    cookie = xhs_note.cookie_from_config()
+    if cookie:
+        progress.update("fetch", 11, "匿名失败 → 带已配置的 Cookie 重试")
+        try:
+            raw = xhs_note.fetch(source, cookie=cookie)
+            return _norm_xhs_note(raw), None, []
+        except xhs_note.XhsError as e:
+            log(f"小红书带 Cookie 解析也失败：{e}")
+            progress.update("fetch", 12, f"带 Cookie 仍失败（{str(e)[:40]}）")
+    else:
+        progress.update("fetch", 12, "匿名失败，且未配置 Cookie，尝试下载器通道")
+
+    got = _mcp_try_download(source, progress)
+    if got and got.get("images"):
+        title = got.get("title") or ""
+        note = {
+            "kind": "images", "title": title,
+            "desc": "", "author": "", "publish_time": "", "tags": [],
+            "url": source, "note_id": xhs_note.extract_note_id(source) or "",
+            "remote_images": [],
+        }
+        return note, None, list(got["images"])
+    if got and got.get("video"):
+        note = {
+            "kind": "video", "title": got.get("title") or "",
+            "desc": "", "author": "", "publish_time": "", "tags": [],
+            "url": source, "note_id": xhs_note.extract_note_id(source) or "",
+            "remote_images": [],
+        }
+        return note, Path(got["video"]), []
+
+    raise RuntimeError("小红书解析失败。\n" + XHS_COOKIE_HINT)
+
+
+def archive_xhs_note(note: dict, local_images: list[Path], run_dir: Path,
+                     progress: Progress, source: str = "") -> dict:
+    """图文笔记归档：下载原图（或直接用已落盘的图）→ 保真 md（不改写一字）。"""
+    notes_dir = run_dir / "notes"
+    assets_dir = notes_dir / "images"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+
+    files = list(local_images)
+    if not files and note.get("remote_images"):
+        progress.update("fetch", 55, f"下载原图 {len(note['remote_images'])} 张")
+        cookie = xhs_note.cookie_from_config()
+        files = xhs_note.download_images(note, assets_dir, cookie=cookie)
+    elif files:
+        # MCP 产出已在 downloads/，复制进 run 目录一起归档
+        assets_dir.mkdir(parents=True, exist_ok=True)
+        moved: list[Path] = []
+        for i, src in enumerate(sorted(files, key=lambda p: p.name), 1):
+            target = assets_dir / f"note_{i:02d}{src.suffix.lower() or '.jpg'}"
+            try:
+                shutil.copy2(src, target)
+                moved.append(target)
+            except Exception:
+                continue
+        files = moved
+
+    progress.update("convert", 70, "生成保真归档 md")
+    rel = [Path("images") / p.name for p in files]
+    md = xhs_note.to_markdown(note, image_files=rel)
+
+    title = note.get("title") or "小红书笔记"
+    final = notes_dir / xhs_note.filename_for(title)
+    final.write_text(md, encoding="utf-8")
+
+    res = {
+        "video_type": "小红书图文笔记",
+        "source_type": "xhs_note",
+        "title": title,
+        "author": note.get("author", ""),
+        "account": note.get("author", ""),
+        "publish_time": note.get("publish_time", ""),
+        "url": note.get("url") or source,
+        "duration": 0,
+        "chapters": [],
+        "frames_used": 0,
+        "image_count": len(files),
+        "cost": {"cost_cny": 0},
+        "elapsed_sec": 0,
+    }
+    progress.update("write", 90, f"写入归档 md（{len(files)} 张配图）")
+    log(f"归档完成：{final}")
+    return {"result": res, "notes": [str(final)], "title": title}
+
+
+def write_xhs_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
+    """小红书图文笔记的 ima 待上传清单。"""
+    manifest = {
+        "final_md": str(final_md),
+        "title": final_md.name,
+        "knowledge_base_id": IMA_KB_ID,
+        "folder_hint": ARTICLE_FOLDER_HINT,
+        "source_type": "xhs_note",
+        "source_url": res.get("url", ""),
+        "author": res.get("author", ""),
+        "image_count": res.get("image_count", 0),
+        "delete_local_after_verify": True,
+        "notes_dir": str(notes_dir),
+        "intermediate": [],
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    p = notes_dir / ".ima_pending.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
 def run_one(source: str, no_publish: bool = False, keep: bool = False,
             wait_manual: int = 30, ts: str | None = None,
-            agent_write: bool = False, local_only: bool = False) -> dict:
-    """处理单条输入（视频号 / 公众号文章 / 直链 / 本地文件）。
+            agent_write: bool = False, local_only: bool = False,
+            by_platform: bool = False, no_worker: bool = False) -> dict:
+    """处理单条输入（视频号 / 小红书 / 公众号文章 / 其它平台链接 / 本地文件）。
 
     这是单条模式的完整逻辑，也被批量模式逐条复用。
     返回统一结构，便于批量层汇总：
         {
           "source": 原始输入,
           "ok": bool,
-          "source_type": "video" | "article",
+          "source_type": "video" | "article" | "xhs_note",
           "video_type": 类型名,
           "title": 最终标题,
           "run_dir": run 目录,
@@ -896,15 +1229,24 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
           "cost_cny": 成本,
           "error": 失败原因（成功为 None）,
         }
+
+    通道分流：
+        公众号文章链接                        → 原文归档（wx_article）
+        小红书链接                            → 图文笔记归档 / 视频笔记转视频通道
+        视频号 & 其它平台（B站/抖音/快手…）    → 视频流水线（转录取帧 OCR → Agent）
     """
     started = time.time()
     stamp = ts or datetime.now().strftime("%Y%m%d_%H%M%S")
     is_article = wx_article.is_article_url(source)
+    is_xhs = xhs_note.is_xhs_url(source)
+    platform_key = platforms.detect(source)
 
     def _out(ok: bool, **kw) -> dict:
         base = {
             "source": source, "ok": ok,
-            "source_type": "article" if is_article else "video",
+            "source_type": ("article" if is_article
+                            else "xhs_note" if is_xhs else "video"),
+            "platform": platform_key,
             "video_type": "", "title": "", "run_dir": None, "final_md": None,
             "pending": None, "agent_input": None, "notes": [], "elapsed_sec": 0,
             "cost_cny": 0.0, "error": None,
@@ -915,9 +1257,13 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
 
     if is_article:
         name = "wechat_article"
+    elif source.startswith("http"):
+        name = f"{platform_key}_video" if platform_key not in ("", "generic") \
+            else "sph_video"
+        if is_xhs:
+            name = "xhs_note"
     else:
-        name = sanitize(Path(source).stem if not source.startswith("http")
-                        else "sph_video", 30)
+        name = sanitize(Path(source).stem, 30)
     run_dir = OUTPUT / f"{stamp}_{name}"
     # 批量下同一秒可能重名，加后缀避免互相覆盖
     suffix = 2
@@ -939,7 +1285,7 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
             res = out["result"]
             notes = out["notes"]
             if not no_publish:
-                notes += publish(res, out["title"], notes)
+                notes += publish(res, out["title"], notes, source=source)
             final_md = Path(notes[0])
             pending = write_article_pending(final_md.parent, final_md, res)
             progress.finish(notes)
@@ -954,15 +1300,87 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
                         run_dir=run_dir, final_md=final_md, pending=pending,
                         notes=notes)
 
+        # ---------- 小红书通道 ----------
+        if is_xhs:
+            progress.update("init", 2, f"小红书笔记 {source[:80]}")
+            note, local_video, local_images = xhs_prepare(source, progress)
+            if note["kind"] == "video" and local_video is None:
+                # 带 Cookie 解析出的视频笔记：直连下载后交给视频流水线
+                progress.update("fetch", 30, "下载小红书视频")
+                local_video = xhs_note.download_video(
+                    note, DOWNLOADS, cookie=xhs_note.cookie_from_config())
+            if local_video is not None:
+                video, is_temp = local_video, True
+                title_hint = platforms.compose_title(note.get("author", ""),
+                                                     note.get("title", ""))
+                if title_hint:
+                    platforms.write_title_sidecar(video, title_hint)
+                log(f"小红书视频笔记 → 转视频流水线：{video.name}")
+                # 落到下方共用的视频通道
+            else:
+                out = archive_xhs_note(note, local_images, run_dir, progress,
+                                       source=source)
+                res = out["result"]
+                res["platform"] = "xiaohongshu"
+                notes = out["notes"]
+                if not no_publish:
+                    notes += publish(res, out["title"], notes, source=source)
+                final_md = Path(notes[0])
+                pending = write_xhs_pending(final_md.parent, final_md, res)
+                progress.finish(notes)
+                log("=" * 50)
+                log(f"完成！小红书图文笔记《{res['title'][:40]}》"
+                    f"（配图 {res.get('image_count', 0)} 张）")
+                for n in notes:
+                    log(f"  {n}")
+                log("-" * 50)
+                log(f"最终交付物: {final_md}")
+                log(f"待上传清单: {pending}")
+                return _out(True, video_type="小红书图文笔记", title=res["title"],
+                            run_dir=run_dir, final_md=final_md, pending=pending,
+                            notes=notes)
+
         # ---------- 视频通道 ----------
-        progress.update("init", 2, f"开始处理 {source[:80]}")
-        video, is_temp = resolve_source(source, run_dir, progress, wait_manual)
+        if video is None:
+            progress.update("init", 2, f"开始处理 {source[:80]}")
+            got = resolve_source(source, run_dir, progress, wait_manual,
+                                 prefer_worker=not no_worker)
+            video = got.get("video")
+            is_temp = bool(got.get("is_temp"))
+            # 通用图集兜底：非小红书平台但下载器只吐了图片时，也走归档而不是报错
+            if video is None and got.get("images"):
+                img_note = {
+                    "kind": "images", "title": got.get("title") or "",
+                    "desc": "", "author": "", "publish_time": "", "tags": [],
+                    "url": source, "note_id": "", "remote_images": [],
+                }
+                out = archive_xhs_note(img_note, list(got["images"]), run_dir,
+                                       progress, source=source)
+                res = out["result"]
+                res["source_type"] = "xhs_note"
+                res["platform"] = platform_key
+                notes = out["notes"]
+                if not no_publish:
+                    notes += publish(res, out["title"], notes, source=source)
+                final_md = Path(notes[0])
+                pending = write_xhs_pending(final_md.parent, final_md, res)
+                progress.finish(notes)
+                log(f"完成！{platforms.label(platform_key)}图集归档《{res['title'][:40]}》")
+                for n in notes:
+                    log(f"  {n}")
+                return _out(True, video_type="图集归档", title=res["title"],
+                            run_dir=run_dir, final_md=final_md, pending=pending,
+                            notes=notes)
+            if video is None:
+                raise RuntimeError("未获取到可处理素材（既无视频也无图片）")
+
         out = run_stages(video, is_temp, cfg=load_config(), run_dir=run_dir,
                          progress=progress, keep=keep,
                          facts_only=agent_write, source=source,
-                         local_only=local_only)
+                         local_only=local_only, platform_key=platform_key)
 
         res = out["result"]
+        res["platform"] = platform_key
         notes = out["notes"]
 
         # ---------- Agent 模式：只出干净源，不生成、不发布 Qwen 版 ----------
@@ -973,7 +1391,7 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
                        if agent_input else None)
             progress.finish(notes)
             log("=" * 50)
-            log(f"完成（Agent 模式）！类型={res['video_type']} "
+            log(f"完成（Agent 模式）！平台={platforms.label(platform_key)} "
                 f"帧数={res['frames_used']} 成本=¥{res['cost']['cost_cny']} "
                 f"耗时={res['elapsed_sec']}s")
             for n in notes:
@@ -982,7 +1400,7 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
                 log("-" * 50)
                 log(f"待办清单: {pending}")
                 log("Agent 下一步：读 agent_input.json → 按内容写笔记 → "
-                    "上传 ima「大李老师」→ 回读校验 → 删本地")
+                    "上传 ima「你的知识库」→ 回读校验 → 删本地")
             return _out(True, video_type=res.get("video_type", ""),
                         title=out.get("title", ""), run_dir=run_dir,
                         final_md=None, pending=pending, notes=notes,
@@ -990,7 +1408,8 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
                         cost_cny=float(res.get("cost", {}).get("cost_cny", 0) or 0))
 
         if not no_publish:
-            notes += publish(res, out["title"], notes)
+            notes += publish(res, out["title"], notes, source=source,
+                             by_platform=by_platform)
 
         # 写 ima 待上传清单（最终交付物 = 整合后的单文件 md）
         final_md = next((Path(n) for n in notes
@@ -1003,9 +1422,9 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
 
         progress.finish(notes)
         log("=" * 50)
-        log(f"完成！类型={res['video_type']} 章节={len(res['chapters'])} "
-            f"帧数={res['frames_used']} 成本=¥{res['cost']['cost_cny']} "
-            f"耗时={res['elapsed_sec']}s")
+        log(f"完成！平台={platforms.label(platform_key)} 类型={res['video_type']} "
+            f"章节={len(res['chapters'])} 帧数={res['frames_used']} "
+            f"成本=¥{res['cost']['cost_cny']} 耗时={res['elapsed_sec']}s")
         for n in notes:
             log(f"  {n}")
         if final_md:
@@ -1155,7 +1574,7 @@ def write_batch_pending(batch_dir: Path, results: list[dict]) -> Path | None:
             "seq": i,
             "final_md": str(md),
             "title": md.name,
-            "knowledge_base_id": "001a8016b30037f0",
+            "knowledge_base_id": IMA_KB_ID,
             "folder_hint": (ARTICLE_FOLDER_HINT if is_article
                             else ("项目复刻教学"
                                   if r.get("video_type") == VIDEO_TYPE_PROJECT
@@ -1171,7 +1590,7 @@ def write_batch_pending(batch_dir: Path, results: list[dict]) -> Path | None:
     manifest = {
         "batch": True,
         "count": len(items),
-        "knowledge_base_id": "001a8016b30037f0",
+        "knowledge_base_id": IMA_KB_ID,
         "delete_local_after_verify": True,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "items": items,
@@ -1198,7 +1617,7 @@ def write_batch_agent_pending(batch_dir: Path,
             "title": r.get("title") or "",
             "video_type": r.get("video_type") or "",
             "source_url": r.get("source"),
-            "folder_id": AGENT_FOLDER_ID,
+            "folder_id": IMA_FOLDER_ID,
             "notes_dir": str(ai.parent),
         })
     if not items:
@@ -1208,14 +1627,14 @@ def write_batch_agent_pending(batch_dir: Path,
         "mode": "agent_write",
         "batch": True,
         "count": len(items),
-        "knowledge_base_id": "001a8016b30037f0",
-        "folder_id": AGENT_FOLDER_ID,
+        "knowledge_base_id": IMA_KB_ID,
+        "folder_id": IMA_FOLDER_ID,
         "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "agent_steps": [
             "逐条读 agent_input.json 的 facts / transcript / ocr（禁止读任何 *.md）",
             "按每条内容自定结构写笔记 → 存 outputs/_新版笔记/seqNN_标题.md",
             "音频文案取自 segments（带 mm:ss），原样保留",
-            f"逐条上传 ima「大李老师」({AGENT_FOLDER_ID}) → 回读校验 → 命中后删本地",
+            f"逐条上传 ima「你的知识库」({IMA_FOLDER_ID}) → 回读校验 → 命中后删本地",
         ],
         "items": items,
     }
@@ -1279,7 +1698,9 @@ def run_batch(sources: list[str], args) -> int:
                     wait_manual=args.wait_manual,
                     agent_write=getattr(args, "agent_write", False),
                     local_only=bool(getattr(args, "agent_write", False)
-                                    and not getattr(args, "with_vision", False)))
+                                    and not getattr(args, "with_vision", False)),
+                    by_platform=getattr(args, "publish_by_platform", False),
+                    no_worker=getattr(args, "no_worker", False))
         results.append(r)
 
         if r["ok"]:
@@ -1322,7 +1743,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(
         description="一键视频分析流水线：单条或批量。")
     ap.add_argument("sources", nargs="*",
-                    help="一条或多条：视频号链接 / 公众号文章链接 / 直链 / 本地文件路径")
+                    help="一条或多条：视频号 / B站 / 抖音 / 小红书 / 快手等平台链接、"
+                         "公众号文章链接、直链、本地文件路径")
     ap.add_argument("--from-file", metavar="FILE",
                     help="从文件读取链接（一行一条，# 开头为注释）")
     ap.add_argument("--resume", metavar="BATCH_DIR",
@@ -1335,6 +1757,12 @@ def main() -> int:
     ap.add_argument("--with-vision", action="store_true",
                     help="配合 --agent-write：保留付费视觉模型（硅基流动），"
                          "仅在需要无人值守的超大批量时才用；默认纯本地")
+    ap.add_argument("--publish-by-platform", action="store_true",
+                    help="发布时在类型目录下再按平台分子目录（如 "
+                         "outputs/公众号视频项目/功能提升教学/B站/）")
+    ap.add_argument("--no-worker", action="store_true",
+                    help="禁用云端解析 Worker，视频号强制走本地/微信通道"
+                         "（不想注册 Cloudflare 的人用这条；也可设 SPH_NO_WORKER=1）")
     ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
     args = ap.parse_args()
 
@@ -1357,13 +1785,15 @@ def main() -> int:
     if len(sources) == 1:
         r = run_one(sources[0], no_publish=args.no_publish, keep=args.keep,
                     wait_manual=args.wait_manual, agent_write=args.agent_write,
-                    local_only=local_only)
+                    local_only=local_only,
+                    by_platform=args.publish_by_platform,
+                    no_worker=args.no_worker)
         if r["ok"]:
             log("-" * 50)
             if args.agent_write:
                 log(f"模式：Agent 写笔记｜{'纯本地（零 API 调用）' if local_only else '含付费视觉模型'}")
                 log("Agent 下一步：看 contact_sheet 判断类型 → 按需读原帧 → "
-                    "按内容写笔记 → 上传 ima「大李老师」→ 回读校验 → 删本地")
+                    "按内容写笔记 → 上传 ima「你的知识库」→ 回读校验 → 删本地")
             else:
                 log("Agent 下一步：上传该 md 到 ima → 回读校验 → 校验通过后删本地文件")
             return 0

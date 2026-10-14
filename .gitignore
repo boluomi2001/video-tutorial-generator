@@ -16,6 +16,10 @@ tools/wx_channels_download*/cache/
 tools/wx_channels_download*/logs/
 tools/wx_channels_download*/downloads/
 tools/wx_channels_download_v260907/
+
+# 本机自生成的根证书（含私钥）—— 绝不能入库
+tools/wx_channels_download*/certs/
+local-ca.key
 tools/wx_channel/*
 # 保留配置模板（不含任何真实凭据，供使用者复制后自行填写）
 !tools/wx_channel/config.example.yaml
@@ -86,3 +90,14 @@ tools/weixin-favor-kb/_backup_*/
 tools/weixin-favor-kb/_dense/
 tools/weixin-favor-kb/_probe/
 tools/weixin-favor-kb/_test_link*.txt
+
+# ============================================
+# 本地临时产物（含下载文件名清单 = 个人收藏内容）
+# ============================================
+_cleanup_manifest.json
+tools/weixin-favor-kb/links*.txt
+_audit_privacy.py
+_tmp_*.md
+
+# 参考文档里不要出现的个人痕迹（防手滑提交）
+# 如确需在本机记录，请放到 .workbuddy/memory/ 下

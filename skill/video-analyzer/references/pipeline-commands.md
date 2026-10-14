@@ -2,9 +2,13 @@
 
 ## 路径常量
 
+> `<项目根>` = 你把本仓库 clone 到的地方（例如 `~/video-tutorial-generator`、
+> `D:\code\video-tutorial-generator`）。下面命令里的路径都按这个相对关系写，
+> **不要照抄某台机器的绝对路径**。
+
 ```
-项目根:   D:\work\2026-07-12-13-31-07
-工具根:   D:\work\2026-07-12-13-31-07\tools\weixin-favor-kb
+项目根:   <项目根>
+工具根:   <项目根>\tools\weixin-favor-kb
 Python:   <工具根>\venv\Scripts\python.exe
 下载目录: <工具根>\downloads\
 输出根:   <工具根>\output\

@@ -1,17 +1,19 @@
 ---
 name: video-tutorial-generator
 description: >-
-  视频（尤其是微信视频号）→ 结构化笔记的一键流水线。当用户粘贴视频号链接、B站/YouTube/直链或本地视频文件，
+  视频 / 小红书笔记（图文&视频）/ 公众号文章 → 结构化笔记的一键流水线。
+  当用户粘贴视频号链接、B站/抖音/快手/微博/YouTube 等平台链接、小红书分享链接
+  （xiaohongshu.com / xhslink.cn）或本地视频文件，
   并说"分析这个视频""扒一下这个视频""这个视频讲了啥""视频转笔记""生成教程""生成复刻教程"
-  "生成功能教程/效率提升教程""展开为复刻教程""看看这个视频怎么做的"等时触发。
+  "生成功能教程/效率提升教程""展开为复刻教程""看看这个视频怎么做的""扒一下这篇小红书笔记"等时触发。
   默认走「Agent 写笔记」模式（纯本地、零 API 成本）：流水线只产出干净素材
   （Whisper 转录 + 分桶抽帧 + 本地 OCR + 缩略图拼版），视觉理解与写笔记全部由 Agent 完成，
   笔记结构按每条视频的内容自适应；也保留传统 Qwen 自动生成模式（--with-vision）。
-  另含公众号文章通道（原文归档，一字不改）。
+  另含小红书图文笔记通道（原文归档 + 配图本地化）与公众号文章通道（原文归档，一字不改）。
   agent_created: true
 ---
 
-# 视频 / 公众号文章 → 结构化笔记生成器
+# 视频 / 小红书笔记 / 公众号文章 → 结构化笔记生成器
 
 ## 零、Agent 执行 SOP（拿到链接后照做）
 
@@ -20,7 +22,10 @@ description: >-
 | 输入 | 通道 |
 |---|---|
 | 含 `mp.weixin.qq.com/s` | **公众号文章通道**（原文归档，不改写）→ 见 §13 |
-| 其余（视频号 / 直链 / 本地文件） | **视频通道** → 见下 |
+| 含 `xiaohongshu.com` / `xhslink.cn` / `xhslink.com` / `rednote.com` | **小红书通道** → 见 §14 |
+| 视频号 / B站 / 抖音 / 快手 / 微博 / YouTube… / 本地文件 | **视频通道** → 见下 |
+
+> 平台识别由 `modules/platforms.py` 负责，无需自己写判断；`auto_run.py` 在 `run_one()` 里分流。
 
 ### 视频通道：默认走「Agent 写笔记」模式（纯本地 · 零 API 成本）
 
@@ -128,8 +133,25 @@ subprocess.Popen(
 
 **下载优先级（视频号）**：`resolve_source()` 依次尝试
 1. **云端 Worker**（`SphWorkerClient`）— 免微信登录、免本地进程，2-5 秒出直链
-2. 本地 MCP 下载器（需微信视频号页面已连接）
+2. **本地 MCP 下载器**（`wxchannels:page` / `sph`）— 需微信视频号页面已连接
 3. wx_channel 本地服务 API → 等待手动下载
+
+### 本地通道（微信）—— 实测可用，零注册
+
+`--no-worker` 或环境变量 `SPH_NO_WORKER=1` 可**跳过 Worker** 强制走这条。
+
+**用户要做的**：① 下载器保持运行；② 在电脑版微信里打开「视频号」并点开任意视频（保持页面开着）。
+之后下载器会**从微信流量里自动抓到所需凭据**，`get_platform_status` 里
+`wxchannels:page` 与 `wxchannels:sph` 两条都会变成 `available=True`。
+
+实测（2026-10-14）：18 分钟视频 **9 秒**下载完成（1080p / 155MB）；重跑同一链接 **1 秒复用**。
+
+⚠️ **两个坑（已在 `modules/wx_download.py` 里处理）**：
+1. `download_wxchannels_video` 的 `existing_action` 默认 `error` —— 重跑同一条链接会
+   直接报冲突，调用方若在等落盘就会白等到超时。所以 `download_video()` 默认传 `overwrite`。
+2. 视频号任务的 `source_url` 常是**空字符串**，按 URL 匹配永远命不中。
+   必须先用 `content_id_of()` 解析出 `wxchannels:<id>`，再用
+   `find_finished_task(content_id=…)` 命中复用。
 
 ### 云端解析（Cloudflare Worker）— 视频号推荐通道
 
@@ -463,13 +485,25 @@ JSON
 > ⚠️ **凭证文件严禁入库**：`scripts/_ima_up*/**.json` 含 COS 临时密钥，已在 `.gitignore`。
 > 凭证约 12 小时过期，配合 `create_media` 现取现用即可。
 
-### 12.2 固定 ID
+### 12.2 知识库 / 文件夹 ID —— 个人配置，不入库
 
-- **知识库**：`001a8016b30037f0`（朝の度的知识库）
-- **目标文件夹「大李老师」（当前约定：平铺放入）**：`folder_7512859667859656`
-  - 旧的 `folder_7512536198941318` **已失效**（用户重建过文件夹，勿再用）
-  - 历史文件夹：`folder_7483004846882248`（项目复刻教学）、
-    `folder_7483004888827852`（功能提升教学）
+这两个 ID 属于**使用者个人信息**，仓库里不含硬编码值，从 `config.yaml` 读：
+
+```yaml
+# tools/weixin-favor-kb/config.yaml
+ima:
+  knowledge_base_id: "<你的知识库ID>"
+  folder_id: "<目标文件夹ID>"      # 可留空 = 平铺到知识库根目录
+```
+
+优先级：环境变量 `IMA_KB_ID` / `IMA_FOLDER_ID` > `config.yaml` 的 `ima` 段 > 空。
+
+**怎么拿到**：用 ima 客户端打开你的知识库，链接里的那段就是知识库 ID；
+在知识库里打开（或新建）目标文件夹，链接里 `folder_xxxx` 即 folder_id。
+
+> ⚠️ **留空时的行为**：`upload_md()` 会抛 `ImaNotConfigured` 并打印配置方法 ——
+> **不猜 ID、不静默跳过**。不用 ima 的人完全可以留空，
+> `.agent_pending.json` 当普通清单文件读即可，不影响出笔记。
 
 ### 12.3 回读校验（**删本地前必须做**）
 
@@ -560,9 +594,131 @@ python auto_run.py "https://mp.weixin.qq.com/s/XXXX"
 
 ---
 
-## 十四、开发与维护
+## 十四、小红书通道（图文归档 / 视频转流水线）
 
-### 14.1 ⚠️ Skill 三处副本必须同步
+### 14.1 前置条件：**零配置**（2026-10-15 更正 —— 早前写错了）
+
+**不需要登录、不需要 Cookie。** 真正的前提只有两条：
+
+| # | 前提 | 说明 |
+|---|---|---|
+| 1 | 链接里必须带 **`xsec_token`** | 即「**分享出来的链接**」。小红书 App 里打开笔记 →「分享」→「复制链接」产出的就是。裸链接 `/explore/<id>`、浏览器地址栏直接复制/手打的链接**通常不带 token，匿名拿不到详情** |
+| 2 | 请求必须用**移动端 UA** | 笔记详情内联在移动端页面的 `noteData.data.noteData`；桌面端 `__INITIAL_STATE__` 目前只有 feed |
+
+实测对照（同一条笔记）：
+
+| 请求 | 结果 |
+|---|---|
+| App 分享链接 + 无 Cookie | ✅ 拿到图文详情 |
+| App 分享链接 + 完整 Cookie | ✅ 拿到详情 |
+| 裸 `/explore/<id>`（无 token） | ❌ 拿不到 |
+
+> ⚠️ **早前的错误结论**（已纠正，别再写回去）：
+> 曾把「下载器适配器解析失败」和「裸链接失败」归因成「笔记详情需要登录态」，
+> 于是在文档里写成"硬约束：必须配 Cookie"，还让用户去 F12 复制。
+> 真实原因有两个：① 当时解析器只认桌面形态 `note.noteDetailMap`，
+> 补上移动端 `noteData.data.noteData` 后就通了；② 失败的那两条链接本来就不带 token。
+> **与登录无关。**
+
+**只有这些情况才真的需要登录态**：私密笔记、仅关注可见、token 失效且无法重新分享。
+此时可选（二选一，或都不做）：
+
+```powershell
+# 扫码：会弹出浏览器窗口显示二维码，扫完自动写入 config.yaml
+login_xhs.cmd
+login_xhs.cmd --paste                    # 扫码不可用时改粘贴
+login_xhs.cmd --validate-only --check-url "<一条小红书笔记链接>"   # 功能校验
+```
+
+```yaml
+# tools/weixin-favor-kb/config.yaml（一般留空）
+xhs:
+  cookie: "web_session=...; a1=...; webId=..."
+```
+
+> **流水线默认匿名请求，只有匿名失败才用这个 Cookie**（`xhs_prepare()` 的降级链：
+> 匿名 → 带 Cookie → 下载器 MCP），所以留空是推荐状态。
+> 环境变量 `XHS_COOKIE` 优先级更高。
+
+> **Agent 侧 SOP**：遇到小红书解析失败，**先检查链接有没有 `xsec_token`**，
+> 十有八九是用户从地址栏复制的。让他回 App「分享 → 复制链接」重发即可，
+> 不要一上来就让他扫码。
+>
+> ⚠️ 另两个坑（脚本已处理，改代码别踩回去）：
+> 1. **未登录也会下发 `web_session`** → 不能据此判定登录成功；
+>    扫码脚本改用「登录弹窗消失」判定。
+> 2. **headless 会被风控**（页面变「安全限制 IP存在风险 300012」）→ 扫码必须 headless=False。
+
+### 14.2 分流规则
+
+| 笔记形态 | 判定 | 走向 |
+|---|---|---|
+| **图文笔记** | 有 `imageList`、无视频直链 | 下载原图 → 保真归档 md（**原文不改写**） |
+| **视频笔记** | 解析出 `video.media.stream` 直链 | 下载视频 → **转入「视频通道」**（转录+抽帧+OCR+Agent 写笔记） |
+
+无 Cookie 时的降级：先试下载器 MCP 免登录通道；仍失败则**快速报错**并输出
+配置 Cookie 的操作指引（不再白等下载超时）。
+
+### 14.3 产出结构
+
+```
+output/<ts>_xhs_note/notes/
+├── <笔记标题>.md          # 最终交付物（原文 + 配图引用 + 标签）
+├── images/note_01.jpg…    # 原图本地化（离线可读）
+└── .ima_pending.json      # 待上传清单
+outputs/小红书笔记/         # 发布副本（md + images/ 同目录）
+```
+
+归档 md 头：`# 标题` → 作者/发布时间/原文链接/类型 → 说明行 → 正文原文 →
+`## 配图`（`![](images/note_01.jpg)`）→ `## 标签`（`#话题　#话题`）。
+
+### 14.4 解析要点（踩过的坑，均已实测）
+
+1. **短链必须用移动端 UA 展开**：桌面 UA 请求 `xhslink.cn/...` 会被 302 到
+   `/login?redirectPath=...`，目标路径被吞；移动端 UA 才直接跳到
+   `discovery/item/<id>?xsec_token=...`。展开结果若仍是登录页，从
+   `redirectPath` 参数里把真实地址捞回来。
+2. **同一个笔记有两种页面形态，都要认**（`_extract_note()` 已处理）：
+   | UA | 详情位置 | 是否能拿到笔记 |
+   |---|---|---|
+   | **移动端（UA_MOBILE）** | `noteData.data.noteData` | ✅ **首选**（匿名即可，不需要 Cookie） |
+   | 桌面端 | `note.noteDetailMap[<id>].note` | ❌ 实测**即使带 Cookie 也只有 feed、无 note** |
+   | 异常兜底 | `noteData.errorNoteData.noteData` | — |
+   | 预加载兜底 | `noteData.normalNotePreloadData`（仅 title/desc/imagesList） | — |
+   → **UA 顺序：移动端优先，桌面端兜底。**
+3. `__INITIAL_STATE__` 里有 JS 字面量 `undefined`，不是合法 JSON → **必须替换成 `null`** 再解析。
+4. 作者字段两种拼法：`user.nickname`（桌面） / `user.nickName`（移动）——都要试。
+5. 配图字段与**尺寸陷阱**：`imageList[i].infoList` 里 **H5_DTL 在前、H5_PRV 在后**，
+   而 **H5_PRV 是 `!style_xxx` 缩略图**——实测同一张图 H5_DTL 61,959B vs
+   H5_PRV 5,495B（**差 11 倍**）。所以**不要取 infoList 末位**，按
+   `H5_DTL > item.url > urlDefault > urlPre > 非 style_ > 末位` 取（`_pick_image_url()`）。
+   ⚠️ 图片 URL 的 `!xxx` 后缀**不能删**，删掉直接 403。
+6. 视频直链：`video.media.stream.{h264,h265,av1}[0].masterUrl`；兜底用
+   `video.consumer.originVideoKey` 拼 `https://sns-video-bd.xhscdn.com/<key>`。
+7. 笔记形态判定：`type == "video"` 或存在视频直链 → **视频笔记**（转视频通道）；
+   否则有 `imageList` → **图文笔记**（归档通道）。
+   ⚠️ 视频笔记的 `imageList` 里那 1 张是**封面**，不是配图，别当成图文处理。
+8. **键名陷阱**：`xhs_note.fetch()` 返回的 URL 列表叫 `images`，
+   通道内部规范化后的笔记叫 `remote_images`（避免与「已落盘的本地图片路径」混淆）。
+   `download_images()` 两个键都认；新代码里两个名字混用是最容易踩的坑。
+9. 配图 md 引用必须保留相对目录：`![note_01](images/note_01.jpg)`——
+   md 在 `notes/`、图在 `notes/images/`，只写 `note_01.jpg` 会链接失效。
+10. 无 Cookie 抛 `XhsNeedCookie`（专门异常），**不要**退化成空笔记。
+
+### 14.5 代码位置
+
+- `modules/xhs_note.py`：`is_xhs_url()` / `resolve_short()` / `fetch()` /
+  `download_images()` / `download_video()` / `to_markdown()` / `filename_for()`
+- `modules/platforms.py`：`detect()` / `resolve_redirect()` / `clean_title()` /
+  `compose_title()` / `wait_for_artifacts()`
+- `auto_run.py`：`xhs_prepare()` / `archive_xhs_note()` / `write_xhs_pending()`，
+  `run_one()` 按 `is_xhs_url` 分流
+
+---
+
+## 十五、开发与维护
+
+### 15.1 ⚠️ Skill 三处副本必须同步
 
 改一处漏同步 → 新会话会读到旧版：
 
@@ -578,7 +734,7 @@ cp skill/video-analyzer/SKILL.md .workbuddy/skills/video-analyzer/SKILL.md
 cp skill/video-analyzer/SKILL.md ~/.workbuddy/skills/video-analyzer/SKILL.md
 ```
 
-### 14.2 本地备份（改代码前必做）
+### 15.2 本地备份（改代码前必做）
 
 ```bash
 cd <工具根> && B="_backup_$(date +%Y%m%d)" && mkdir -p "$B" \
@@ -587,7 +743,7 @@ cd <工具根> && B="_backup_$(date +%Y%m%d)" && mkdir -p "$B" \
 cp -r $B/modules/* modules/ && cp $B/auto_run.py $B/step2_analyze.py .
 ```
 
-### 14.3 关键代码位置
+### 15.3 关键代码位置
 
 | 文件 | 职责 |
 |---|---|
@@ -596,23 +752,40 @@ cp -r $B/modules/* modules/ && cp $B/auto_run.py $B/step2_analyze.py .
 | `modules/frames.py` | `extract_keyframes()`（分桶择优）+ **`build_contact_sheet()`**（缩略图拼版） |
 | `modules/ocr.py` | RapidOCR（**本地、零成本、带时间戳**） |
 | `modules/transcribe.py` | Whisper（>300s 自动切 small） |
-| `modules/wx_download.py` | `SphWorkerClient`（云端 Worker）/ `MCPClient`（本地下载器） |
+| `modules/wx_download.py` | `SphWorkerClient`（云端 Worker）/ `MCPClient`（本地下载器：`download_content` / `find_finished_task`） |
+| `modules/platforms.py` | 多平台识别 / 短链展开 / 标题清洗与旁路 / 产物等待（`wait_for_artifacts`） |
 | `modules/wx_article.py` | 公众号文章通道 |
+| `modules/xhs_note.py` | 小红书笔记通道（解析 / 图集下载 / 归档 md） |
 
-### 14.4 已验证的修复记录
+### 15.4 已验证的修复记录
 
 | 日期 | 问题 | 修复 |
 |---|---|---|
 | 2026-10-06 | `step2_analyze.py` 调用 `extract_keyframes(threshold=…)` 但该函数**无此形参** → 必然 `TypeError`（两步工作流是坏的） | 删掉 `threshold=`（已核实 `analyze()` / `classify_content()` / `templates/obsidian.md` 均存在且签名匹配，删这一行即可跑通） |
 | 2026-10-06 | `config.yaml` 的 `frames.max_frames: 20` 在主链路无效 | 已记录实际为 36；`frames.threshold` 是死配置 |
 | 2026-10-06 | Agent 模式仍会发布 Qwen 版到 `outputs/` | `--agent-write` 跳过 `publish()` 与 `write_ima_pending()` |
+| 2026-10-14 | **重跑同一条非视频号链接会卡满 900s**：下载器遇「已存在该下载内容」返回冲突错误，而 `wait_for_completion` 一直等到超时 | `download_content` 默认 `existing_action="overwrite"`；并新增 `find_finished_task()` 复用已下载产物（实测 2.1s） |
+| 2026-10-14 | **小红书无 Cookie 时白等超时**：解析层失败后仍调用下载，下载必然也失败 | `_mcp_try_download()` 解析失败即短路；小红书直接返回 None；非小红书下载超时降到 120s |
+| 2026-10-14 | **小红书短链展开拿到登录页**：桌面 UA 请求 `xhslink.cn` 会被 302 到 `/login?redirectPath=...`，目标路径被吞 | 短链展开改用移动端 UA；结果若仍是登录页，从 `redirectPath` 参数捞回真实地址 |
+| 2026-10-14 | `platforms.detect('mp.weixin.qq.com/...')` 误判为 `wxchannels` | `mp.weixin.qq.com` 必须先于 `weixin.qq.com` 判断（前者也 endswith 后者） |
+| 2026-10-14 | **小红书带 Cookie 仍解析不到笔记**：只按桌面形态取 `note.noteDetailMap`，而实测**只有移动端页面**内联了笔记详情 | 新增 `_extract_note()` 支持 4 种形态（移动端 `noteData.data.noteData` 优先）；UA 顺序改为移动端优先；作者字段 `nickname`/`nickName` 都试；配图 URL 增加 `url` 兜底 |
+| 2026-10-14 | **视频笔记报「这条笔记没有视频直链」**：`_norm_xhs_note()` 丢掉了 `video_url` | 规范化笔记保留 `video_url` |
+| 2026-10-14 | **图文笔记配图 0 张**：`download_images()` 只读 `images`，而通道内部用 `remote_images` | `download_images()` 两个键都认；全部失败时抛错而不是静默返回空 |
+| 2026-10-14 | 归档 md 配图链接失效：`to_markdown()` 只取 `p.name`，丢掉 `images/` 前缀 | 保留调用方给的相对路径（`images/note_01.jpg`） |
+| 2026-10-14 | **配图下载成了缩略图**：`infoList` 里 H5_PRV（`!style_xxx`）排在后面，取「末位」拿到的是缩略图，61,959B → 5,495B | 新增 `_pick_image_url()`：优先 `imageScene=H5_DTL`；URL 的 `!xxx` 后缀不可删（删了 403） |
+| 2026-10-14 | **重跑视频号链接卡满 2 分钟**：`download_wxchannels_video` 的 `existing_action` 默认 `error`，封装时没传 | `download_video()` 默认 `existing_action="overwrite"` |
+| 2026-10-14 | **视频号任务无法复用**：这类任务 `source_url` 常为空串，URL 匹配永远不中 | 新增 `content_id_of()` + `find_finished_task(content_id=…)`（实测 1 秒复用） |
+| 2026-10-14 | 下载器根证书是 SunnyNet 旧证书（硬编码私钥，官方自己警告） | 新增 `scripts/make_ca.py` 换成本机自生成 CA；已验证代理链路 + 删除用户存储旧证书（机器存储需管理员） |
+| 2026-10-15 | **重要认知更正**：早前把「下载器解析失败 + 裸链接失败」误判为「笔记详情需要登录态」，据此写成"硬约束必须配 Cookie"并让用户 F12 复制 | 实测证明**与登录无关**：App 分享链接（带 `xsec_token`）**匿名即可解析**；真实原因是当时解析器只认桌面形态 + 原链接不带 token。已改为「匿名优先 → Cookie → 下载器」降级链，`XhsNeedCookie` 更名 `XhsUnavailable` |
+| 2026-10-15 | 每次请求裸奔（不带任何 Cookie）可能更易被风控 | 无 Cookie 路径改用**进程级访客 jar**（自动带上服务端下发的 `abRequestId`/`acw_tc`） |
 
-### 14.5 发版 SOP
+### 15.5 发版 SOP
 
 1. 更新版本号与 README；
 2. `git add` / `git commit`（**注意排除 `_backup_*/`、`scripts/_ima_up*/**.json`、`output/`**）；
-3. 推送**必须走本机代理** `http://127.0.0.1:7897`：
-   偶发 `schannel: server closed abruptly` → 加 `-c http.proxy=… -c https.proxy=…` 重试；
+3. 推送：**沙箱里直接 `git push` 即可**（沙箱已注入 `HTTP_PROXY`/`HTTPS_PROXY`）。
+   ⚠️ **不要**显式加 `-c http.proxy=127.0.0.1:7897`——那是本机代理，沙箱不可达；
+   偶发 `schannel: server closed abruptly` 时重试即可；
 4. 打包：`git archive --format=zip --prefix=<name>-<ver>/ -o <out>.zip HEAD`；
 5. 打 tag 并推送；GitHub MCP **没有 create_release** → 走 REST + curl（代理）创建 release 与附件；
 6. 用 `mcp__github__get_latest_release` 校验。

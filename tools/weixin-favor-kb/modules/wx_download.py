@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 import urllib.error
@@ -24,6 +25,14 @@ from modules.paths import DOWNLOADER_DIRS, REPO_ROOT
 SERVICE_HOST = "127.0.0.1"
 SERVICE_PORT = 2025          # 旧版 wx_channel 本地服务端口
 TIMEOUT = 15
+
+
+def _norm_url(url: str) -> str:
+    """URL 规范化：去掉协议差异、尾斜杠与查询串，便于跨形态匹配同一条内容。"""
+    s = (url or "").strip().lower()
+    s = re.sub(r"^https?://", "", s)
+    s = s.split("?")[0].split("#")[0]
+    return s.rstrip("/")
 
 WX_EXE = REPO_ROOT / "tools" / "wx_channel" / "wx_channel.exe"
 WX_CWD = WX_EXE.parent
@@ -387,7 +396,8 @@ class MCPClient:
         self.url = url
         self._inited = False
 
-    def _rpc(self, method: str, params: dict | None = None, rid: int | None = 1) -> dict:
+    def _rpc(self, method: str, params: dict | None = None, rid: int | None = 1,
+             timeout: int = 120) -> dict:
         body = {"jsonrpc": "2.0", "method": method}
         if params is not None:
             body["params"] = params
@@ -397,7 +407,7 @@ class MCPClient:
             self.url, data=json.dumps(body).encode("utf-8"), method="POST",
             headers={"Content-Type": "application/json",
                      "Accept": "application/json, text/event-stream"})
-        with _opener().open(req, timeout=120) as r:
+        with _opener().open(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "ignore")
         if not raw.strip():
             return {}
@@ -415,10 +425,14 @@ class MCPClient:
         self._rpc("notifications/initialized", {}, rid=None)
         self._inited = True
 
-    def call(self, name: str, arguments: dict) -> dict:
-        """调用工具，返回 content 里的结构化数据（尽力解析 JSON）。"""
+    def call(self, name: str, arguments: dict, timeout: int = 120) -> dict:
+        """调用工具，返回 content 里的结构化数据（尽力解析 JSON）。
+
+        timeout 是**客户端**等待上限：下载类调用要放大，否则大文件会中途抛超时。
+        """
         self._ensure()
-        res = self._rpc("tools/call", {"name": name, "arguments": arguments}, rid=99)
+        res = self._rpc("tools/call", {"name": name, "arguments": arguments},
+                        rid=99, timeout=timeout)
         if "error" in res:
             raise DownloadError(f"MCP {name} 错误: {res['error']}")
         content = (res.get("result") or {}).get("content") or []
@@ -436,24 +450,105 @@ class MCPClient:
         except Exception:
             return False
 
-    def download_video(self, url: str, download_dir: str = "") -> dict:
+    def download_video(self, url: str, download_dir: str = "",
+                       existing_action: str = "overwrite",
+                       timeout: int = 900) -> dict:
         """直接下载视频号视频（需微信视频号页面已连接）。
 
-        注意：download_wxchannels_video 只接受 url / download_dir / filename 等，
-        传 wait_for_completion 会报「unknown field」——等待完成要自己轮询任务。
+        ⚠️ 两个实测坑：
+          1) `download_wxchannels_video` **不接受** `wait_for_completion`
+             （传了会报 unknown field）——要等完成得自己轮询任务；
+          2) `existing_action` 默认是 "error"：重跑同一条链接会直接报冲突，
+             调用方若在等文件落盘就会白等。所以这里默认 overwrite。
         """
-        args = {"url": url}
+        args = {"url": url, "existing_action": existing_action}
         if download_dir:
             args["download_dir"] = download_dir
-        return self.call("download_wxchannels_video", args)
+        return self.call("download_wxchannels_video", args, timeout=timeout)
+
+    def content_id_of(self, url: str, timeout: int = 90) -> tuple[str, str, str]:
+        """解析链接，返回 (content_id, 标题, 作者昵称)。失败返回空串。
+
+        视频号链接也走 fetch_content，实测可用（platform=wxchannels）。
+        content_id 形如 `wxchannels:15031440988364872372`，可直接用来命中已下载任务。
+        """
+        try:
+            r = self.call("fetch_content", {"url": url, "timeout_seconds": timeout},
+                          timeout=timeout + 30)
+        except Exception:
+            return "", "", ""
+        c = r.get("content") or {}
+        acct = r.get("account") or {}
+        return (str(c.get("id") or ""), str(c.get("title") or ""),
+                str(acct.get("nickname") or ""))
 
     def download_content(self, url: str, download_dir: str = "",
-                         wait: bool = True, timeout: int = 900) -> dict:
-        """通用平台下载（B站/抖音/快手/微博等，无需浏览器）。"""
+                         wait: bool = True, timeout: int = 900,
+                         existing_action: str = "overwrite") -> dict:
+        """通用平台下载（B站/抖音/小红书/快手/微博等，无需浏览器）。
+
+        ⚠️ existing_action 默认给 "overwrite"：
+           下载器默认遇到「已存在该下载内容」会直接返回冲突错误，而 wait_for_completion
+           会一直等到超时（实测卡满 900s）。重跑同一条链接是常态操作，
+           因此默认覆盖重下，保证「新文件落盘」这条检测逻辑始终成立。
+        """
         args = {"url": url, "wait_for_completion": wait, "timeout_seconds": timeout}
         if download_dir:
             args["download_dir"] = download_dir
-        return self.call("download_content", args)
+        if existing_action:
+            args["existing_action"] = existing_action
+        # 客户端等待上限要略大于服务端的 timeout_seconds，否则会被自己掐断
+        return self.call("download_content", args, timeout=timeout + 60)
+
+    def find_finished_task(self, source_url: str = "",
+                           alt_urls: tuple[str, ...] = (),
+                           content_id: str = "") -> dict | None:
+        """找最近一条已完成、且文件仍在磁盘上的下载任务（用于复用已有产物）。
+
+        匹配优先级：
+          1) `content_id` 精确匹配（最可靠。视频号任务的 `source_url` 常为空字符串，
+             只能靠 content_id；调用方可用 `content_id_of()` 拿到）
+          2) 规范化 URL 匹配（短链/长链形态不同，调用方把展开后的 URL 放 alt_urls）
+        """
+        try:
+            res = self.tasks(statuses=[5])
+        except Exception:
+            return None
+        items = res.get("list") or res.get("items") or []
+        if not isinstance(items, list):
+            return None
+
+        def _files_ok(t: dict) -> bool:
+            return any(isinstance(f, dict)
+                       and Path(str(f.get("file_path") or "")).exists()
+                       for f in (t.get("files") or []))
+
+        if content_id:
+            for t in items:
+                if isinstance(t, dict) and str(t.get("content_id") or "") == content_id \
+                        and _files_ok(t):
+                    return t
+
+        wants = {_norm_url(source_url)} | {_norm_url(u) for u in alt_urls if u}
+        wants.discard("")
+        if not wants:
+            return None
+        for t in items:
+            if not isinstance(t, dict):
+                continue
+            if _norm_url(str(t.get("source_url") or "")) in wants and _files_ok(t):
+                return t
+        return None
+
+    def files_of(self, task: dict) -> list[Path]:
+        """取任务里仍在磁盘上的文件路径。"""
+        out: list[Path] = []
+        for f in (task or {}).get("files") or []:
+            if isinstance(f, dict):
+                p = Path(str(f.get("file_path") or ""))
+                if p.exists():
+                    out.append(p)
+        return out
 
     def tasks(self, statuses: list[int] | None = None) -> dict:
         args = {"page": 1, "page_size": 20}

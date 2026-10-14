@@ -2,7 +2,7 @@
 """
 批量把视频 oid 换成可分享的 H5 链接，生成完整清单。
 
-输入:  dali_shufang_videos.json（mcp_list_videos.py 产出）
+输入:  <账号>_videos.json（mcp_list_videos.py 产出）
 输出:
   - <name>_links.txt      纯链接（一行一条，可直接喂给 auto_run.py --from-file）
   - <name>_index.md       人读清单表（序号/日期/标题/互动/链接）
@@ -18,8 +18,17 @@ from mcp_list_videos import mcp_call  # noqa: E402
 
 
 def main():
-    src = Path(sys.argv[1]) if len(sys.argv) > 1 else Path(
-        "D:/work/2026-07-12-13-31-07/output/dali_shufang_videos.json")
+    """用法: python build_link_index.py <videos.json> [账号名] [简介]
+
+    账号名/简介只用于清单标题，默认取通用文案（不要在仓库里写死个人账号）。
+    """
+    if len(sys.argv) < 2:
+        print(__doc__)
+        print("用法: python build_link_index.py <videos.json> [账号名] [简介]")
+        sys.exit(2)
+    src = Path(sys.argv[1])
+    account = sys.argv[2] if len(sys.argv) > 2 else "我的视频号"
+    bio = sys.argv[3] if len(sys.argv) > 3 else ""
     rows = json.load(open(src, encoding="utf-8"))
     out_base = src.with_name(src.stem.replace("_videos", ""))
 
@@ -58,10 +67,10 @@ def main():
     total_like = sum(v.get("like", 0) for v in rows)
     total_fwd = sum(v.get("forward", 0) for v in rows)
     lines = [
-        "# 大李书房一盏灯 · 视频清单",
+        f"# {account} · 视频清单",
         "",
-        f"- 账号：大李书房一盏灯（科普博主，新疆 乌鲁木齐）",
-        f"- 简介：为了逼自己一把 Learn in public 而开了这个账号，专门采用费曼学习法来和各位一起学习 AI。日拱一卒，无限进步",
+        f"- 账号：{account}",
+        *([f"- 简介：{bio}"] if bio else []),
         f"- 抓到视频数：**{len(rows)}** 条（账号页面标记 89 条，差 3 条为置顶/已删除/受限）",
         f"- 时间范围：{rows[-1]['pub_date']} ~ {rows[0]['pub_date']}",
         f"- 累计点赞 {total_like:,}  累计转发 {total_fwd:,}",

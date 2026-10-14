@@ -13,14 +13,19 @@
     1. 检查 Python 版本（3.10~3.12 最佳，3.13 有依赖兼容风险）
     2. 解压 installer/ 里的视频下载器到 tools/wx_channels_download/
     3. 生成下载器 config.yaml（落盘目录指向本项目 downloads/，开启 MCP 端口 2022）
-    4. 生成流水线 config.yaml（填入 LLM API Key）
+    4. 生成流水线 config.yaml（大模型 Key 现在**可选**——默认 Agent 模式零 Key 可用）
     5. 检查 / 安装 ffmpeg
     6. 创建 venv 并安装依赖
-    7. 打印后续操作与 MCP 注册配置
+    7. 自动把 MCP 注册进 Agent 的配置（~/.workbuddy/mcp.json），并把小红书扫码登录串上
+    8. 打印后续操作（视频号两条通道怎么选）
+
+设计前提：**默认「Agent 写笔记」模式不调用任何大模型 API**，所以安装阶段不需要
+任何 Key。只有要用传统 Qwen 自动生成模式时才需要填 LLM Key。
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shutil
 import subprocess
@@ -35,12 +40,18 @@ DOWNLOADER = REPO_ROOT / "tools" / "wx_channels_download"
 INSTALLER_DIR = REPO_ROOT / "installer"
 DOWNLOADS = TOOL_ROOT / "downloads"
 DEFAULT_PORT = 2022
+MCP_NAME = "wx_channels_download"
 
 OK, WARN, FAIL, STEP = "[OK]", "[WARN]", "[FAIL]", "[STEP]"
 
 
 def say(tag: str, msg: str) -> None:
     print(f"{tag} {msg}", flush=True)
+
+
+def venv_python() -> Path:
+    venv = TOOL_ROOT / "venv"
+    return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
 # ---------------------------------------------------------------- 1. Python
@@ -106,7 +117,8 @@ def write_pipeline_config(api_key: str, base_url: str, model: str,
         return False
 
     text = tpl.read_text(encoding="utf-8")
-    text = text.replace("sk-你的硅基流动APIKey", api_key or "sk-请填入你的APIKey")
+    text = text.replace("sk-你的硅基流动APIKey",
+                        api_key or "sk-可选_默认Agent模式不需要")
     text = text.replace("https://api.siliconflow.cn/v1", base_url)
     if model:
         text = text.replace("Qwen/Qwen3-VL-32B-Instruct", model)
@@ -114,12 +126,86 @@ def write_pipeline_config(api_key: str, base_url: str, model: str,
     target.write_text(text, encoding="utf-8")
     say(OK, f"已生成 {target}")
 
-    if not api_key:
-        say(WARN, "未传 --api-key，config.yaml 里 api_key 是占位符，跑之前记得补上")
+    if api_key:
+        say(OK, "已填入 LLM API Key（传统 Qwen 模式可用）")
+    else:
+        say(OK, "未填 LLM API Key —— 没关系：默认「Agent 写笔记」模式"
+                "完全不需要 Key，零成本；只有要用 --with-vision 传统模式时才需要补")
     return True
 
 
-# ------------------------------------------------------------- 5. ffmpeg
+# ------------------------------------------------- 5.5 注册 MCP + 小红书登录
+def mcp_config_paths() -> list[Path]:
+    """可能的 Agent MCP 配置文件位置（存在哪个就写哪个，都没有则只打印）。"""
+    home = Path.home()
+    cands = [home / ".workbuddy" / "mcp.json"]
+    if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            cands.append(Path(appdata) / "Claude" / "claude_desktop_config.json")
+    else:
+        cands.append(home / "Library" / "Application Support" / "Claude"
+                     / "claude_desktop_config.json")
+    return cands
+
+
+def register_mcp(explicit: str, disable: bool) -> None:
+    """把下载器 MCP 合并进 Agent 配置（**合并不覆盖**，保留其它 server）。"""
+    if disable:
+        say(WARN, "--no-mcp：跳过 MCP 注册，详见下面打印的配置片段")
+        return
+
+    entry = {"type": "streamable-http", "url": f"http://127.0.0.1:{DEFAULT_PORT}/mcp"}
+    targets = [Path(explicit)] if explicit else [p for p in mcp_config_paths()
+                                                 if p.parent.exists()]
+    if not targets:
+        say(WARN, "没找到 Agent 的 MCP 配置文件，请手动把下面片段加进去")
+        print(MCP_SNIPPET)
+        return
+
+    for path in targets:
+        data: dict = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+                path.with_suffix(path.suffix + ".bak").write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            except Exception as e:
+                say(WARN, f"{path} 解析失败（{str(e)[:60]}），已跳过，未改动原文件")
+                continue
+        servers = data.setdefault("mcpServers", {})
+        old = servers.get(MCP_NAME)
+        servers[MCP_NAME] = entry
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        say(OK, f"MCP 已{'更新' if old else '写入'} {path}")
+        print("       ⚠️ 需要重启 Agent，并在「连接器 / 自定义连接器」里对本 MCP "
+              "点一次「信任」才会生效。")
+
+
+def login_xhs_hint(run: bool) -> None:
+    """小红书 Cookie：扫码优先，粘贴兜底。"""
+    script = TOOL_ROOT / "scripts" / "login_xhs.py"
+    if not script.exists():
+        return
+    if not run:
+        say(STEP, "抓小红书需要登录 Cookie（一次性）。随时可跑：")
+        print(f"       {TOOL_ROOT / 'login_xhs.cmd'}")
+        print("       或 python scripts/login_xhs.py  （扫码；失败会自动转粘贴模式）")
+        return
+
+    py = venv_python()
+    if not py.exists():
+        py = Path(sys.executable)
+    say(STEP, "启动小红书扫码登录（浏览器会弹窗，用手机小红书 App 扫一次）…")
+    try:
+        subprocess.run([str(py), "-u", str(script)], cwd=str(TOOL_ROOT))
+    except Exception as e:
+        say(WARN, f"扫码登录未完成（{str(e)[:80]}），之后可手动重跑 login_xhs.cmd")
+
+
+# ------------------------------------------------------------- 6. ffmpeg
 FFMPEG_ZIP = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
 
 
@@ -207,34 +293,38 @@ MCP_SNIPPET = """{
 def print_next(launch: bool) -> None:
     print()
     print("=" * 62)
-    print("安装完成。接下来请选择一条视频号通道：")
+    print("安装完成。视频号有两条通道，按需选一条（也可以两条都不配）:")
     print()
-    print("  [推荐] 免登录通道 —— 部署云端解析 Worker（一次性，约 5 分钟）")
-    print("     优点：不用打开微信，不限 Windows，几秒拿直链")
-    print("     需要：一个免费的 Cloudflare 账号")
+    print("  [推荐] 免除登录通道 —— 部署云端解析 Worker（一次性，约 5 分钟）")
+    print("     优点：不用打开微信、几秒拿直链、最稳")
+    print("     需要：一个免费的 Cloudflare 账号（要注册，这步躲不掉）")
     print("     步骤：")
     print("       1) copy tools\\wx_channel\\config.example.yaml "
           "tools\\wx_channel\\config.yaml")
     print("       2) 填入 cloudflare 段的 accountid / apitoken / sphcookie")
     print("       3) cd tools\\wx_channel && "
           ".\\wx_channel.exe sph_deploy --config config.yaml")
-    print("     部署成功后 sphhostname 自动回填，流水线自动读取。")
+    print("     部署成功后 sphhostname 自动回填，流水线自动优先走它。")
     print("     详见 README.md §3.6")
     print()
-    print("  [兜底] 本地通道 —— 需要保持微信打开")
+    print("  [零注册] 微信兜底通道 —— 不想注册 Cloudflare 就用这条")
+    print("     需要：保持微信在跑，并让下载器连上视频号页面")
     print("     1) 启动下载器（Windows 双击即可）：")
     print(f"        {DOWNLOADER}")
     print("        首次允许其修改系统代理，否则抓取功能不可用。")
-    print("     2) 打开微信并进入「视频号」页面，保持在前台/后台都行，")
-    print("        视频号视频的解密必须在微信里完成。")
+    print("     2) 打开微信并进入「视频号」页面")
+    print("     3) 配了 Worker 走 Worker；没配就自动降级走这条")
     print()
-    print("  之后跑一条命令出笔记：")
-    print(f"     {TOOL_ROOT / 'run_auto.cmd'} \"<视频链接或本地文件>\"")
+    print("  其它平台无需任何 Cookie，直接丢链接即可：")
+    print("     B站 / 抖音 / 快手 / 微博 / YouTube …")
+    print("     小红书需要一次登录 Cookie（见上方提示，扫码即可）")
+    print()
+    print("  跑一条命令出笔记：")
+    print(f"     {TOOL_ROOT / 'run_agent.cmd'} \"<链接或本地文件>\"")
     print()
     print("  想在 Agent（如 WorkBuddy / Claude）里直接调用这套能力，")
-    print("  把 skill/video-analyzer/ 复制到你的技能目录，并在 MCP 配置里加：")
-    print()
-    print(MCP_SNIPPET)
+    print("  把 skill/video-analyzer/ 复制到你的技能目录；MCP 已自动注册，")
+    print("  记得重启 Agent 并对该 MCP 点一次「信任」。")
     print("=" * 62)
 
 
@@ -260,7 +350,7 @@ def maybe_launch(launch: bool) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description="视频解析工作流一键安装")
     ap.add_argument("--api-key", default=os.environ.get("LLM_API_KEY", ""),
-                    help="大模型 API Key（硅基流动 SiliconFlow）")
+                    help="大模型 API Key（硅基流动）。**可选**：默认 Agent 模式不需要")
     ap.add_argument("--base-url", default="https://api.siliconflow.cn/v1")
     ap.add_argument("--model", default="Qwen/Qwen3-VL-30B-A3B-Instruct",
                     help="视觉理解模型")
@@ -271,6 +361,13 @@ def main() -> int:
     ap.add_argument("--skip-venv", action="store_true")
     ap.add_argument("--fetch-ffmpeg", action="store_true")
     ap.add_argument("--launch", action="store_true", help="安装后拉起下载器")
+    ap.add_argument("--login-xhs", action="store_true",
+                    help="安装后立刻做小红书扫码登录（推荐，省得回头单独跑）")
+    ap.add_argument("--mcp-config", default="",
+                    help="指定要写入的 Agent MCP 配置文件（默认自动探测 "
+                         "~/.workbuddy/mcp.json 等）")
+    ap.add_argument("--no-mcp", action="store_true",
+                    help="不自动注册 MCP，只打印配置片段")
     args = ap.parse_args()
 
     say(STEP, f"安装根目录：{REPO_ROOT}")
@@ -282,6 +379,8 @@ def main() -> int:
     write_pipeline_config(args.api_key, args.base_url, args.model, args.fast_model)
     ensure_ffmpeg(args.fetch_ffmpeg)
     setup_venv(args.pip_mirror, args.skip_venv)
+    register_mcp(args.mcp_config, args.no_mcp)
+    login_xhs_hint(args.login_xhs)
     maybe_launch(args.launch)
     print_next(args.launch)
     return 0
