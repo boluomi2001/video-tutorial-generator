@@ -43,6 +43,8 @@ PLATFORM_HOSTS: dict[str, tuple[str, ...]] = {
     "x": ("twitter.com", "x.com"),
     "instagram": ("instagram.com",),
     "cctv": ("cctv.com", "cntv.cn", "cctv.cn"),
+    # 飞书云文档 / 知识库（走专门的「文档复刻」通道，见 modules/lark_doc.py）
+    "lark": ("feishu.cn", "feishu.net", "larksuite.com", "larkoffice.com"),
 }
 
 # 中文名（写日志 / 归档目录用）
@@ -59,6 +61,7 @@ PLATFORM_LABELS: dict[str, str] = {
     "cctv": "央视频",
     "wxchannels": "视频号",
     "wxmp": "公众号",
+    "lark": "飞书",
     "generic": "通用",
     "local": "本地文件",
 }

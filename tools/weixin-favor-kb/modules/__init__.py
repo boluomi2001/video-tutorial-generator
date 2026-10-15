@@ -6,7 +6,7 @@ from modules.frames import extract_keyframes
 from modules.ocr import OCRProcessor
 from modules.classifier import classify_content
 from modules.analyzer import ContentAnalyzer
-from modules import platforms, xhs_note, wx_article
+from modules import platforms, xhs_note, wx_article, lark_doc
 
 __all__ = [
     "extract_audio",
@@ -18,4 +18,5 @@ __all__ = [
     "platforms",
     "xhs_note",
     "wx_article",
+    "lark_doc",
 ]

@@ -19,18 +19,25 @@
     --publish-by-platform  发布时在类型目录下再按平台分子目录
     --no-worker       禁用云端解析 Worker，视频号强制走本地/微信通道
     --wait-manual N   等待手动下载的分钟数（默认 30）
+    --lark-dest D     飞书链接去向：wiki=复刻到自己飞书知识库（默认）｜md=本地归档
+    --lark-target T   复刻目标位置（默认 my_library；也可给知识库节点 token）
 
 支持的输入（按链接自动分流）:
     微信视频号     → 云端 Worker 解析（免登录）→ 视频流水线
     B站 / 抖音 / 快手 / 微博 / YouTube …  → 下载器 MCP → 视频流水线
     小红书         → 图文笔记归档（需 Cookie）/ 视频笔记转视频流水线
     公众号文章     → 抓取 → 保真转 Markdown（原文归档，不改写）
+    飞书文档/知识库 → 复刻到自己飞书知识库（保真，含图片与内嵌视频）
+                     或本地归档 md（--lark-dest md，供上传 ima）
     本地文件       → 直接进视频流水线
 
 流程（视频通道）:
     下载 → 转录 → 抽帧 → OCR → 分析 → 三形态笔记 → 清理
 流程（小红书图文通道）:
     解析笔记 → 下载原图 → 保真归档 md（不改写）→ 清理
+流程（飞书通道）:
+    dest=wiki：抓文档 XML → 在自己知识库建新文档（媒体自动迁移）→ 回读校验
+    dest=md  ：抓文档 markdown → 素材下载到 assets/ → 保真归档 md
 
 批量模式:
     串行逐条执行，单条失败不中断后续；每条独立 run 目录（沿用 output/）。
@@ -70,7 +77,7 @@ except Exception:
 import yaml
 from loguru import logger
 
-from modules import platforms, wx_article, wx_download, xhs_note
+from modules import platforms, lark_doc, wx_article, wx_download, xhs_note
 from modules.analyzer import VIDEO_TYPE_PROJECT, ContentAnalyzer
 from modules.audio import extract_audio
 from modules.frames import build_contact_sheet, extract_keyframes, resolve_ffmpeg
@@ -84,6 +91,8 @@ PROJECT_ROOT = ROOT.parent.parent
 PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "公众号视频项目"
 # 小红书图文/视频笔记的归档目录（原文归档，不改写）
 XHS_PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "小红书笔记"
+# 飞书文档本地归档（--lark-dest md）的发布目录；dest=wiki 时产物在飞书知识库里
+LARK_PUBLISH_ROOT = PROJECT_ROOT / "outputs" / "飞书文档"
 # 公众号文章归档的 ima 目标文件夹（知识分享类 → 功能提升教学）
 ARTICLE_FOLDER_HINT = "功能提升教学"
 
@@ -94,6 +103,10 @@ CONFIG_DEFAULT = {
     "llm": {"api_key": "", "base_url": "https://api.siliconflow.cn/v1",
             "model": "Qwen/Qwen3-VL-32B-Instruct"},
     "ocr": {"confidence_threshold": 0.5},
+    # 飞书通道：dest=wiki 复刻到自己飞书知识库；dest=md 本地归档（供上传 ima）
+    # target：docs +create 的落点，默认 my_library（个人文档库）
+    # parent_node_token：指定父节点 token（要给某个知识库节点下建子文档时用）
+    "lark": {"dest": "wiki", "target": "my_library", "parent_node_token": ""},
 }
 
 
@@ -182,6 +195,25 @@ def _ima_setting(key: str, env_name: str) -> str:
 
 IMA_KB_ID = _ima_setting("knowledge_base_id", "IMA_KB_ID")
 IMA_FOLDER_ID = _ima_setting("folder_id", "IMA_FOLDER_ID")
+
+
+def _lark_setting(key: str, default: str = "") -> str:
+    """读飞书通道配置：环境变量 > config.yaml 的 lark 段 > 默认值。
+
+    个人相关信息（目标位置 / 父节点 token）不入库，用配置或环境变量给：
+      LARK_DEST          → lark.dest
+      LARK_TARGET        → lark.target
+      LARK_PARENT_NODE   → lark.parent_node_token
+    """
+    env_name = {"dest": "LARK_DEST", "target": "LARK_TARGET",
+                "parent_node_token": "LARK_PARENT_NODE"}.get(key, "")
+    v = (os.environ.get(env_name) or "").strip() if env_name else ""
+    if v:
+        return v
+    try:
+        return str((load_config().get("lark") or {}).get(key) or "").strip() or default
+    except Exception:
+        return default
 IMA_KB_NAME = "你的 ima 知识库"
 
 
@@ -937,6 +969,28 @@ def publish(res: dict, title: str, notes: list[str],
                     shutil.copy2(f, img_dst / f.name)
         return out
 
+    if res.get("source_type") == "lark_doc":
+        # 飞书通道：dest=md 时是「md + assets/」；dest=wiki 时是复刻留痕 md。
+        # 两种都整份复制，md 里的 assets/ 相对引用保持可用。
+        dest_dir = LARK_PUBLISH_ROOT
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        out: list[str] = []
+        src_md = Path(notes[0])
+        for src in notes:
+            p = Path(src)
+            if p.name == "raw.json":
+                continue
+            shutil.copy2(p, dest_dir / p.name)
+            out.append(str(dest_dir / p.name))
+        assets_src = src_md.parent / "assets"
+        if assets_src.is_dir():
+            assets_dst = dest_dir / "assets"
+            assets_dst.mkdir(parents=True, exist_ok=True)
+            for f in assets_src.iterdir():
+                if f.is_file():
+                    shutil.copy2(f, assets_dst / f.name)
+        return out
+
     sub = "项目复刻教学" if res["video_type"] == VIDEO_TYPE_PROJECT else "功能提升教学"
     dest_dir = PUBLISH_ROOT / sub
     if by_platform:
@@ -1207,18 +1261,128 @@ def write_xhs_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
     return p
 
 
+# ------------------------------------------------------------ 飞书文档通道
+
+LARK_PREP_HINT = (
+    "飞书通道跑不起来时按顺序排查：\n"
+    "  1) 有没有 lark-cli？WorkBuddy 在连接器里启用「飞书」，或 npm i -g @larksuite/cli；\n"
+    "  2) 授权了没？跑 `lark-cli auth login --as user` 扫码，一次即可；\n"
+    "  3) 文档你能看吗？只能读**你自己账号有权限**的文档 —— 别人单篇分享给你的可以，\n"
+    "     公开链接但没分享给你的读不到；\n"
+    "  4) 想复制**别人整个知识库**？需对方把你加为该知识库成员 —— 否则 `wiki +node-copy`\n"
+    "     会报 131006。本通道走「抓 XML → 建新文档」重建，绕开该限制。"
+)
+
+
+def write_lark_pending(notes_dir: Path, final_md: Path, res: dict) -> Path:
+    """飞书文档本地归档（dest=md）的 ima 待上传清单。"""
+    manifest = {
+        "final_md": str(final_md),
+        "title": final_md.name,
+        "knowledge_base_id": IMA_KB_ID,
+        "folder_hint": ARTICLE_FOLDER_HINT,
+        "source_type": "lark_doc",
+        "source_url": res.get("url", ""),
+        "asset_count": res.get("asset_count", 0),
+        "delete_local_after_verify": True,
+        "notes_dir": str(notes_dir),
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    p = notes_dir / ".ima_pending.json"
+    p.write_text(json.dumps(manifest, ensure_ascii=False, indent=2),
+                 encoding="utf-8")
+    return p
+
+
+def run_lark(source: str, run_dir: Path, progress: Progress, dest: str = "wiki",
+             target: str = "my_library", parent_node_token: str = "") -> dict:
+    """飞书通道：复刻到自己知识库（dest=wiki）或本地归档 md（dest=md，供 ima）。
+
+    与其它通道一致：不做转录/抽帧/分析，文档本身就是交付物。
+    dest=wiki 时，飞书文档 XML 里的媒体 token 支持跨文档复用，
+    `docs +create` 会把图片与内嵌视频一并迁移过去（保真，不是降级）。
+    """
+    notes_dir = run_dir / "notes"
+    notes_dir.mkdir(parents=True, exist_ok=True)
+    dest = (dest or "wiki").strip().lower()
+    if dest not in ("wiki", "md"):
+        raise ValueError(f"--lark-dest 只能是 wiki 或 md，收到 {dest!r}")
+
+    # ---------- 去向 ②：本地归档 md（素材落 notes/assets/，供上传 ima）----------
+    if dest == "md":
+        progress.update("fetch", 15, "抓取飞书文档")
+        info = lark_doc.archive_markdown(source, notes_dir)
+        log(f"飞书文档：{info['title'][:60]}（素材 {info['asset_count']} 个）")
+
+        progress.update("convert", 70, "保真转换 Markdown")
+        md = lark_doc.to_markdown(info)
+        final = notes_dir / lark_doc.filename_for(info["title"])
+        final.write_text(md, encoding="utf-8")
+        try:  # 便于复核/重转的原始内容
+            (run_dir / "lark_raw_markdown.txt").write_text(info["body_md"],
+                                                           encoding="utf-8")
+        except Exception:
+            pass
+
+        res = {
+            "video_type": "飞书文档",
+            "source_type": "lark_doc",
+            "title": info["title"],
+            "url": source,
+            "lark_dest": "md",
+            "asset_count": info["asset_count"],
+            "duration": 0, "chapters": [], "frames_used": 0,
+            "cost": {"cost_cny": 0}, "elapsed_sec": 0,
+        }
+        progress.update("write", 90, "写入归档 md")
+        log(f"归档完成：{final}")
+        return {"result": res, "notes": [str(final)], "title": info["title"],
+                "lark_url": "", "verified": None}
+
+    # ---------- 去向 ①：复刻到自己飞书知识库 ----------
+    progress.update("fetch", 10, "抓取飞书文档 XML")
+    out = lark_doc.replicate(source, run_dir, target_position=target,
+                             parent_node_token=parent_node_token)
+    log(f"复刻完成：{out['title'][:60]} → {out['url']}")
+    if out.get("note"):
+        log(f"回读校验：{out['note']}")
+
+    progress.update("write", 90, "写入复刻留痕")
+    record = notes_dir / lark_doc.filename_for(out["title"])
+    record.write_text(lark_doc.clone_record_md(out, source), encoding="utf-8")
+
+    res = {
+        "video_type": "飞书文档复刻",
+        "source_type": "lark_doc",
+        "title": out["title"],
+        "url": source,
+        "lark_url": out["url"],
+        "lark_doc_id": out["document_id"],
+        "lark_dest": "wiki",
+        "verified": bool(out.get("verified")),
+        "asset_count": (out.get("stats") or {}).get("source", 0),
+        "duration": 0, "chapters": [], "frames_used": 0,
+        "cost": {"cost_cny": 0}, "elapsed_sec": 0,
+    }
+    log(f"归档留痕：{record}")
+    return {"result": res, "notes": [str(record)], "title": out["title"],
+            "lark_url": out["url"], "verified": out.get("verified")}
+
+
 def run_one(source: str, no_publish: bool = False, keep: bool = False,
             wait_manual: int = 30, ts: str | None = None,
             agent_write: bool = False, local_only: bool = False,
-            by_platform: bool = False, no_worker: bool = False) -> dict:
-    """处理单条输入（视频号 / 小红书 / 公众号文章 / 其它平台链接 / 本地文件）。
+            by_platform: bool = False, no_worker: bool = False,
+            lark_dest: str = "", lark_target: str = "",
+            lark_parent: str = "") -> dict:
+    """处理单条输入（视频号 / 小红书 / 公众号文章 / 飞书文档 / 其它平台链接 / 本地文件）。
 
     这是单条模式的完整逻辑，也被批量模式逐条复用。
     返回统一结构，便于批量层汇总：
         {
           "source": 原始输入,
           "ok": bool,
-          "source_type": "video" | "article" | "xhs_note",
+          "source_type": "video" | "article" | "xhs_note" | "lark_doc",
           "video_type": 类型名,
           "title": 最终标题,
           "run_dir": run 目录,
@@ -1232,6 +1396,7 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
 
     通道分流：
         公众号文章链接                        → 原文归档（wx_article）
+        飞书文档 / 知识库链接                  → 复刻到自己飞书知识库 / 本地归档（lark_doc）
         小红书链接                            → 图文笔记归档 / 视频笔记转视频通道
         视频号 & 其它平台（B站/抖音/快手…）    → 视频流水线（转录取帧 OCR → Agent）
     """
@@ -1239,13 +1404,15 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
     stamp = ts or datetime.now().strftime("%Y%m%d_%H%M%S")
     is_article = wx_article.is_article_url(source)
     is_xhs = xhs_note.is_xhs_url(source)
+    is_lark = lark_doc.is_lark_url(source)
     platform_key = platforms.detect(source)
 
     def _out(ok: bool, **kw) -> dict:
         base = {
             "source": source, "ok": ok,
             "source_type": ("article" if is_article
-                            else "xhs_note" if is_xhs else "video"),
+                            else "xhs_note" if is_xhs
+                            else "lark_doc" if is_lark else "video"),
             "platform": platform_key,
             "video_type": "", "title": "", "run_dir": None, "final_md": None,
             "pending": None, "agent_input": None, "notes": [], "elapsed_sec": 0,
@@ -1257,6 +1424,8 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
 
     if is_article:
         name = "wechat_article"
+    elif is_lark:
+        name = "feishu_doc"
     elif source.startswith("http"):
         name = f"{platform_key}_video" if platform_key not in ("", "generic") \
             else "sph_video"
@@ -1299,6 +1468,42 @@ def run_one(source: str, no_publish: bool = False, keep: bool = False,
             return _out(True, video_type="公众号文章", title=res["title"],
                         run_dir=run_dir, final_md=final_md, pending=pending,
                         notes=notes)
+
+        # ---------- 飞书文档通道 ----------
+        if is_lark:
+            progress.update("init", 2, f"飞书文档 {source[:80]}")
+            out = run_lark(
+                source, run_dir, progress,
+                dest=lark_dest or _lark_setting("dest", "wiki"),
+                target=lark_target or _lark_setting("target", "my_library"),
+                parent_node_token=(lark_parent
+                                   or _lark_setting("parent_node_token", "")))
+            res = out["result"]
+            notes = out["notes"]
+            if not no_publish:
+                notes += publish(res, out["title"], notes, source=source)
+            final_md = Path(notes[0])
+            # dest=md 才需要 ima 待上传；dest=wiki 正文已在飞书知识库里，无需再传
+            pending = (write_lark_pending(final_md.parent, final_md, res)
+                       if res.get("lark_dest") == "md" else None)
+            progress.finish(notes)
+            log("=" * 50)
+            if res.get("lark_dest") == "wiki":
+                log(f"完成！飞书文档已复刻进你的知识库：{res.get('lark_url')}")
+                log(f"  回读校验：{'通过（媒体与源一致）' if res.get('verified') else '未通过，见上方日志'}")
+            else:
+                log(f"完成！飞书文档本地归档《{res['title'][:40]}》"
+                    f"（素材 {res.get('asset_count', 0)} 个）")
+            for n in notes:
+                log(f"  {n}")
+            log("-" * 50)
+            log(f"最终交付物: {final_md}")
+            if pending:
+                log(f"待上传清单: {pending}")
+            return _out(True, video_type=res["video_type"], title=res["title"],
+                        run_dir=run_dir, final_md=final_md, pending=pending,
+                        notes=notes, lark_dest=res.get("lark_dest"),
+                        lark_url=res.get("lark_url", ""))
 
         # ---------- 小红书通道 ----------
         if is_xhs:
@@ -1700,7 +1905,9 @@ def run_batch(sources: list[str], args) -> int:
                     local_only=bool(getattr(args, "agent_write", False)
                                     and not getattr(args, "with_vision", False)),
                     by_platform=getattr(args, "publish_by_platform", False),
-                    no_worker=getattr(args, "no_worker", False))
+                    no_worker=getattr(args, "no_worker", False),
+                    lark_dest=getattr(args, "lark_dest", None) or "",
+                    lark_target=getattr(args, "lark_target", None) or "")
         results.append(r)
 
         if r["ok"]:
@@ -1764,6 +1971,13 @@ def main() -> int:
                     help="禁用云端解析 Worker，视频号强制走本地/微信通道"
                          "（不想注册 Cloudflare 的人用这条；也可设 SPH_NO_WORKER=1）")
     ap.add_argument("--wait-manual", type=int, default=30, help="等待手动下载的分钟数")
+    ap.add_argument("--lark-dest", choices=["wiki", "md"], default=None,
+                    help="飞书文档链接的去向：wiki=复刻到自己的飞书知识库（默认，"
+                         "图片与内嵌视频一并迁移）；md=本地归档 md（素材落 assets/，"
+                         "供上传 ima）。也可在 config.yaml 的 lark.dest 设默认值")
+    ap.add_argument("--lark-target", default=None,
+                    help="飞书复刻落点：默认 my_library（个人文档库）；"
+                         "也可给知识库节点 token。等价于 lark.target / LARK_TARGET")
     args = ap.parse_args()
 
     # Agent 模式默认「纯本地」：不调 LLM API，视觉/写作都交给 Agent；
@@ -1787,10 +2001,19 @@ def main() -> int:
                     wait_manual=args.wait_manual, agent_write=args.agent_write,
                     local_only=local_only,
                     by_platform=args.publish_by_platform,
-                    no_worker=args.no_worker)
+                    no_worker=args.no_worker,
+                    lark_dest=args.lark_dest or "",
+                    lark_target=args.lark_target or "")
         if r["ok"]:
             log("-" * 50)
-            if args.agent_write:
+            if r.get("source_type") == "lark_doc":
+                if r.get("lark_dest") == "md":
+                    log("Agent 下一步：上传该 md（含 assets/ 素材）到 ima → "
+                        "回读校验 → 校验通过后删本地文件")
+                else:
+                    log(f"Agent 下一步：无需上传 —— 正文已在你的飞书知识库里"
+                        f"（{r.get('lark_url') or '见产物'}）；本地仅留复刻留痕 md")
+            elif args.agent_write:
                 log(f"模式：Agent 写笔记｜{'纯本地（零 API 调用）' if local_only else '含付费视觉模型'}")
                 log("Agent 下一步：看 contact_sheet 判断类型 → 按需读原帧 → "
                     "按内容写笔记 → 上传 ima「你的知识库」→ 回读校验 → 删本地")

@@ -1,5 +1,56 @@
 # 更新日志
 
+## v0.6.0 —— 2026-10-15
+
+**新增「飞书文档 / 知识库」通道：能把飞书文档复刻进自己的飞书知识库（含内嵌视频）**
+
+起因：飞书知识库里经常有内嵌视频，而 ima 不支持视频附件。既然目标本身就是飞书知识库，
+就不必绕「下载 → 本地归档 → 再上传」，直接文档级复刻。
+
+### 新增
+
+- **`modules/lark_doc.py`**（新模块，对标 `modules/wx_article.py`）
+  - `is_lark_url()` / `host_of()`：识别 `feishu.cn` / `feishu.net` / `larksuite.com` /
+    `larkoffice.com` 的 `/wiki/`、`/docx/`、`/docs/` 链接
+  - `_cli_argv()`：定位 `lark-cli`。Windows 上 npm 风格的 `lark-cli` 是无扩展名 sh 脚本，
+    CreateProcess 跑不了 → 优先改走 `node node_modules/@larksuite/cli/scripts/run.js`
+  - `replicate()`：抓文档 XML → `docs +create --doc-format xml` 到自己的知识库
+    → **回读校验**（比对 img/source 数量与每个 source 的字节数）
+  - `archive_markdown()` / `xml_to_markdown()`：本地归档（素材落 `assets/`）
+  - `clone_record_md()`：复刻留痕 md（来源 / 复刻后链接 / 媒体统计 / 校验结果）
+- **`auto_run.py`**
+  - `run_one()` 新增 `is_lark` 分流 → `run_lark()`；`source_type` 增加 `"lark_doc"`
+  - `publish()` 增加飞书分支 → `outputs/飞书文档/`（`dest=md` 时连 `assets/` 一起）
+  - `write_lark_pending()`：仅 `dest=md` 才产出 ima 待上传清单
+  - 新参数 `--lark-dest {wiki,md}`、`--lark-target <位置|节点 token>`
+  - 配置 `/ 环境变量：`lark.dest` / `lark.target` / `lark.parent_node_token`
+    （`LARK_DEST` / `LARK_TARGET` / `LARK_PARENT_NODE`）
+- **`modules/platforms.py`**：`PLATFORM_HOSTS` 增加 `lark`，标签「飞书」
+- 配置模板与 `config.yaml` 增加 `lark` 段；README 增加「附录 A.4 飞书通道」
+
+### 关键实现结论（实测，勿走回头路）
+
+- 飞书 docx 的 `<img src="token"/>` 与 `<source token="..."/>`
+  （含 `<figure view-type="Preview">`）**支持跨文档复用** → CLI 会自动把源媒体
+  **重新上传**到新文档。实测 15 个媒体全换新 token；6 段 mp4 字节数逐一一致
+  （`10350779 / 13797442 / 24945556 / 6496692 / 8895781 / 9035072`）；
+  9 img / 3 table / 40 td / 4 cite / 4 callout / 2 bookmark / 1 pre 结构与源完全一致。
+- ⛔ **`wiki +node-copy` 不能用来复制别人分享的文档**：报 `131006`。
+  根因不是「允许复制」开关，而是**用户不是源知识库成员**
+  （`wiki +node-list --space-id <源>` 同样 `131006`）。对照测试：从有成员权限的空间复制 → 成功。
+- `docs +media-download` 对分享文档无导出权限 → 一律用 `docs +media-preview`。
+- `wiki +node-delete` 必须带 `--obj-type wiki --yes`；lark-cli 的文件参数只接受 **cwd 相对路径**。
+- 本地归档里，**单元格含图/视频的表**不转 Markdown 表格（块级媒体会把表格截断），
+  改写为「`### 第 N 组` + 字段」块结构。
+
+### ⚠️ 已知限制
+
+- **不是开箱即用**：需要本机有 `lark-cli`（WorkBuddy 飞书连接器自带）并
+  `lark-cli auth login --as user` 扫码授权。
+- 只能读写该账号**有权限**的文档；整库搬运需对方把你加为知识库**成员**，且**不递归**。
+- 不搬迁评论、历史版本、权限设置、封面。
+- 内嵌视频在新文档里是**附件块**（可播可下），非源文档那种原位媒体属性。
+
 ## v0.5.2 —— 2026-10-15
 
 **重要更正：小红书不需要登录、不需要 Cookie（零配置）**

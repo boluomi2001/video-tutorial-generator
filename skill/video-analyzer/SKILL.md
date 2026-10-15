@@ -9,11 +9,12 @@ description: >-
   默认走「Agent 写笔记」模式（纯本地、零 API 成本）：流水线只产出干净素材
   （Whisper 转录 + 分桶抽帧 + 本地 OCR + 缩略图拼版），视觉理解与写笔记全部由 Agent 完成，
   笔记结构按每条视频的内容自适应；也保留传统 Qwen 自动生成模式（--with-vision）。
-  另含小红书图文笔记通道（原文归档 + 配图本地化）与公众号文章通道（原文归档，一字不改）。
+  另含小红书图文笔记通道（原文归档 + 配图本地化）、公众号文章通道（原文归档，一字不改）
+  与飞书文档/知识库通道（复刻进自己的飞书知识库，图片与内嵌视频一并迁移；或本地归档给 ima）。
   agent_created: true
 ---
 
-# 视频 / 小红书笔记 / 公众号文章 → 结构化笔记生成器
+# 视频 / 小红书笔记 / 公众号文章 / 飞书文档 → 结构化笔记生成器
 
 ## 零、Agent 执行 SOP（拿到链接后照做）
 
@@ -23,6 +24,7 @@ description: >-
 |---|---|
 | 含 `mp.weixin.qq.com/s` | **公众号文章通道**（原文归档，不改写）→ 见 §13 |
 | 含 `xiaohongshu.com` / `xhslink.cn` / `xhslink.com` / `rednote.com` | **小红书通道** → 见 §14 |
+| 含 `feishu.cn` / `larksuite.com` 且有 `/wiki/`、`/docx/` | **飞书文档通道**（复刻到自己知识库 / 本地归档）→ 见 §15 |
 | 视频号 / B站 / 抖音 / 快手 / 微博 / YouTube… / 本地文件 | **视频通道** → 见下 |
 
 > 平台识别由 `modules/platforms.py` 负责，无需自己写判断；`auto_run.py` 在 `run_one()` 里分流。
@@ -118,6 +120,8 @@ subprocess.Popen(
 | `--keep` | 保留视频与中间文件（默认成功后删除） | 关 |
 | `--no-publish` | 不复制到项目 outputs 目录 | 关 |
 | `--wait-manual <分钟>` | 等待手动下载的最长时间 | 30 |
+| `--lark-dest {wiki,md}` | 飞书链接去向：`wiki`=复刻到自己飞书知识库（含内嵌视频）；`md`=本地归档（素材落 `assets/`，供 ima） | `wiki` |
+| `--lark-target <位置>` | 飞书复刻落点：默认 `my_library`（个人文档库），也可给知识库节点 token | `my_library` |
 
 \* `source` 与 `--from-file` 至少要有一个；两者可同时给（合并后去重）。
 
@@ -716,9 +720,79 @@ outputs/小红书笔记/         # 发布副本（md + images/ 同目录）
 
 ---
 
-## 十五、开发与维护
+## 十五、飞书文档通道（复刻到自己知识库 / 本地归档）
 
-### 15.1 ⚠️ Skill 三处副本必须同步
+飞书链接**自动**走本通道，无需额外参数（`auto_run.py::run_one()` 里 `is_lark` 分流）。
+模块：`modules/lark_doc.py`。
+
+### 15.1 两种去向（`--lark-dest`，按用户选择）
+
+| 去向 | 做什么 | 适用 |
+|---|---|---|
+| `wiki`（默认） | 抓文档 XML → `docs +create` 到**自己的飞书知识库**，图片与内嵌视频一并迁移 | 自己的知识库（**视频附件进不了 ima，就走这条**） |
+| `md` | 抓 markdown → 素材下载到 `assets/` → 保真归档 md | 要交给 ima |
+
+```bash
+python auto_run.py "<飞书文档链接>"                    # 复刻到自己知识库
+python auto_run.py "<飞书文档链接>" --lark-dest md     # 本地归档给 ima
+python auto_run.py "<飞书文档链接>" --lark-target "<知识库节点 token>"
+```
+
+### 15.2 为什么能保真（**核心机制，勿走回头路**）
+
+飞书 docx 的图/视频在 XML 里是 token，而
+`<img src="token"/>`、`<source token="..." name="..."/>`
+（含 `<figure view-type="Preview"><source/></figure>`）**支持跨文档复用** ——
+CLI 会把源媒体**重新上传**到新文档，无需先下载再传。
+
+实测（源文档 9 图 + 6 段视频）：
+
+| 对照项 | 结果 |
+|---|---|
+| 媒体 token | 15 个**全部换新**（真复制，非引用） |
+| 视频字节数 | 6 段逐一一致：`10350779 / 13797442 / 24945556 / 6496692 / 8895781 / 9035072` |
+| `view-type="Preview"` | 6 个全保留 |
+| 结构块 | 9 img / 3 table / 40 td / 4 cite / 4 callout / 2 bookmark / 1 pre 与源**完全一致** |
+| 回读校验 | 新 token 回下 = 13797442 字节，可播 |
+
+`replicate()` 已内置**回读校验**（比对新文档的 img/source 数量 + 每个 source 的字节数），
+结果写进复刻留痕 md。
+
+### 15.3 ⛔ `wiki +node-copy` 不能复制别人分享的文档
+
+报 `131006`。**根因不是「允许复制」开关，而是用户不是源知识库的成员**
+（`wiki +node-list --space-id <源>` 同样 `131006`）。
+对照测试：从用户有成员权限的空间复制 → 成功。
+
+→ 想用 copy 接口，必须让分享者把用户**加为该知识库成员**；否则只能走 §15.2 的 XML 重建。
+→ 推论：**整库一键搬运做不到**（非成员无法枚举目录树），只能逐篇复刻被分享的节点。
+
+### 15.4 其它实测坑
+
+| 坑 | 真相 |
+|---|---|
+| `docs +media-download` | 对分享文档无导出权限 → 一律用 **`docs +media-preview --token <t> --output <相对路径>`** |
+| `wiki +node-delete` | 必须带 `--obj-type wiki --yes`（否则报 `--obj-type is required`） |
+| 文件参数 | lark-cli 的 `--content` / `--output` **只接受 cwd 下相对路径**，绝对路径报 `unsafe file path` |
+| Windows 上找不到 CLI | npm 风格的 `lark-cli` 是**无扩展名 sh 脚本**，CreateProcess 跑不了 → 改调 `node <dir>/node_modules/@larksuite/cli/scripts/run.js`（`_cli_argv()` 已处理） |
+| 本地归档里含媒体的表 | Markdown 表格放不下块级媒体（会把表截断）→ 转为「`### 第 N 组` + 字段」块结构 |
+| 标题重复 | 正文开头的 `<title>` / 首行 `# 标题` 与元信息头重复 → 归档前摘掉 |
+
+### 15.5 前置条件（**非开箱即用**）与限制
+
+```bash
+npm i -g @larksuite/cli        # 或启用 WorkBuddy 的「飞书」连接器（自带）
+lark-cli auth login --as user  # 扫码授权一次
+```
+
+- 只能读写该账号**有权限**的文档：别人单篇分享给你的可以；未分享的公开链接读不到。
+- 不搬迁：评论、历史版本、权限设置、封面。
+- 内嵌视频在新文档里是**附件块**（可播可下），不等于源文档那种原位媒体属性。
+- 产出：`outputs/飞书文档/`（`dest=md` 时连 `assets/` 一起；`dest=wiki` 只放复刻留痕）。
+
+## 十六、开发与维护
+
+### 16.1 ⚠️ Skill 三处副本必须同步
 
 改一处漏同步 → 新会话会读到旧版：
 
@@ -734,7 +808,7 @@ cp skill/video-analyzer/SKILL.md .workbuddy/skills/video-analyzer/SKILL.md
 cp skill/video-analyzer/SKILL.md ~/.workbuddy/skills/video-analyzer/SKILL.md
 ```
 
-### 15.2 本地备份（改代码前必做）
+### 16.2 本地备份（改代码前必做）
 
 ```bash
 cd <工具根> && B="_backup_$(date +%Y%m%d)" && mkdir -p "$B" \
@@ -743,7 +817,7 @@ cd <工具根> && B="_backup_$(date +%Y%m%d)" && mkdir -p "$B" \
 cp -r $B/modules/* modules/ && cp $B/auto_run.py $B/step2_analyze.py .
 ```
 
-### 15.3 关键代码位置
+### 16.3 关键代码位置
 
 | 文件 | 职责 |
 |---|---|
@@ -756,8 +830,9 @@ cp -r $B/modules/* modules/ && cp $B/auto_run.py $B/step2_analyze.py .
 | `modules/platforms.py` | 多平台识别 / 短链展开 / 标题清洗与旁路 / 产物等待（`wait_for_artifacts`） |
 | `modules/wx_article.py` | 公众号文章通道 |
 | `modules/xhs_note.py` | 小红书笔记通道（解析 / 图集下载 / 归档 md） |
+| `modules/lark_doc.py` | 飞书文档通道（`is_lark_url` / `replicate` 复刻到知识库 / `archive_markdown` 本地归档） |
 
-### 15.4 已验证的修复记录
+### 16.4 已验证的修复记录
 
 | 日期 | 问题 | 修复 |
 |---|---|---|
@@ -777,9 +852,11 @@ cp -r $B/modules/* modules/ && cp $B/auto_run.py $B/step2_analyze.py .
 | 2026-10-14 | **视频号任务无法复用**：这类任务 `source_url` 常为空串，URL 匹配永远不中 | 新增 `content_id_of()` + `find_finished_task(content_id=…)`（实测 1 秒复用） |
 | 2026-10-14 | 下载器根证书是 SunnyNet 旧证书（硬编码私钥，官方自己警告） | 新增 `scripts/make_ca.py` 换成本机自生成 CA；已验证代理链路 + 删除用户存储旧证书（机器存储需管理员） |
 | 2026-10-15 | **重要认知更正**：早前把「下载器解析失败 + 裸链接失败」误判为「笔记详情需要登录态」，据此写成"硬约束必须配 Cookie"并让用户 F12 复制 | 实测证明**与登录无关**：App 分享链接（带 `xsec_token`）**匿名即可解析**；真实原因是当时解析器只认桌面形态 + 原链接不带 token。已改为「匿名优先 → Cookie → 下载器」降级链，`XhsNeedCookie` 更名 `XhsUnavailable` |
+| 2026-10-15 | **想「一键复刻别人的飞书知识库」时误以为该用 `wiki +node-copy`** | 报 `131006`，根因是**用户不是源知识库成员**（`node-list` 同样 131006），不是「禁止复制」开关。改用「抓 XML → `docs +create`」重建：`<img src="token"/>` / `<source token=…>` **跨文档复用**，媒体自动重传（实测 15 媒体全换新 token、6 段 mp4 字节数逐一一致） |
+| 2026-10-15 | 本地归档飞书文档时，**含图片/视频的表格被截断成散块** | Markdown 表格放不下块级媒体 → 这类表改为「`### 第 N 组` + 字段」块结构（`_table_to_cards()`）；并把表格处理提前到媒体替换之前 |
 | 2026-10-15 | 每次请求裸奔（不带任何 Cookie）可能更易被风控 | 无 Cookie 路径改用**进程级访客 jar**（自动带上服务端下发的 `abRequestId`/`acw_tc`） |
 
-### 15.5 发版 SOP
+### 16.5 发版 SOP
 
 1. 更新版本号与 README；
 2. `git add` / `git commit`（**注意排除 `_backup_*/`、`scripts/_ima_up*/**.json`、`output/`**）；
